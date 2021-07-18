@@ -4,8 +4,12 @@ TrinityCore custom C++ command for giving players the best items possible at any
 "autobis" is a command you can use on your own compiled installation of TrinityCore to give yourself the "best theoretical" items at any given level.
 
 # Installation Instructions
-Note: these instructions are very crude at the moment. These should work fine with any latest build of TrinityCore, but if not, please let me know.
 
+## Notes
+1. These instructions are very crude at the moment. These should work fine with any latest build of TrinityCore, but if not, please let me know.
+2. These instructions assume you are running Linux. For Windows, you can try following along, albeit you'll have to do things slightly differently.
+
+## Linux Instructions
 1. Download/clone this repository to your computer.
 2. Copy the files ``autobis_misc.cpp`` and ``autobis_misc.h`` to ``<Path_to_your_TC_clone>/src/server/scripts/Commands/``
 3. In that same folder, open up the file named ``cs_misc.cpp``. We're going to make the following changes to that file:
@@ -13,8 +17,11 @@ Note: these instructions are very crude at the moment. These should work fine wi
     2. Look for the following table in the same file: ``static std::vector<ChatCommand> commandTable``. Insert the row listed as "Table row" below this list.
     3. In the same file, but below aforementioned table, insert the function labelled as "Autobis Entry Function" as a member function of the ``misc_commandscript`` class. Ideally, put this function between ``HandleAddItemSetCommand`` and ``HandleBankCommand``.
 4. Now, open up the file ``<Path_to_your_TC_clone>/src/server/game/Accounts/RBAC.h``, search for the table named ``enum RBACPermissions``, and add the following line to the end of the table: ``RBAC_PERM_COMMAND_AUTOBIS = 1222,``
-5. Now, log into MySQL, and source the file ``insert_autobis.sql`` found in this repository.
-6. Congrats! Enjoy!
+    1. Note: put it BEFORE the following line in that table: ``RBAC_PERM_MAX``.
+5. Recompile TrinityCore with ``make rebuild_cache``, followed by ``make install``. (Tip: use the -j8 flag for the second command to speed things up).
+6. Now, log into MySQL, and source the file ``insert_autobis.sql`` found in this repository.
+    1. As a reminder, from the command line, use the following command: ``mysql -u root -p``.
+7. Congrats! Enjoy!
 
 NOTE: If TrinityCore ends up using "1222" for another command down the line, please let me know ASAP. I chose this number because it's far greater than whatever other number is being used currently, but you never know....
 
@@ -22,7 +29,7 @@ NOTE: If TrinityCore ends up using "1222" for another command down the line, ple
 
 ## Table row
 ```
-            { "autobis",          rbac::RBAC_PERM_COMMAND_AUTOBIS,          false, &HandleAutoBisCommand,          "" },
+{ "autobis",          HandleAutoBisCommand,          rbac::RBAC_PERM_COMMAND_AUTOBIS,          Console::No },
 ```
 
 ## Autobis Entry Function
@@ -65,10 +72,14 @@ If you don't understand the code, or don't want to, let me summarize how autobis
 3. Not all of the weight tables are filled out. Feel free to read the code I wrote to figure out how to insert those tables, then have your class-of-choice use those tables.
 
 # Wishlist
+## The code itself
 1. Make sure players can only execute this command ONCE per level.
 2. Don't hardcode these item weights; be able to download "Wowhead.lua" and read that file to automatically create the weights.
 3. Automatically choose the most appropriate stat weight based on a player's talent choices (e.g. if a player specs into Bear Tank, then give them the Bear Tank weights; if a player specs into Cat DPS, then give them the Cat DPS table). This might be a little tricky.
 4. Allow players to set their own custom weights.
+
+## This README file
+1. Write Windows instructions.
 
 # Design Decisions
 1. I've excluded ALL items that don't have a sell value. This is to prevent adding items that might be granted as part of a quest, or might feel too cheaty (e.g. items gained from redeeming tokens dropped by TBC raid bosses).
