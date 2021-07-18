@@ -9,9 +9,9 @@ Note: these instructions are very crude at the moment. These should work fine wi
 1. Download/clone this repository to your computer.
 2. Copy the files ``autobis_misc.cpp`` and ``autobis_misc.h`` to ``<Path_to_your_TC_clone>/src/server/scripts/Commands/``
 3. In that same folder, open up the file named ``cs_misc.cpp``. We're going to make the following changes to that file:
-  1. Below all the lines that start with ``#include `` at the top of the file, insert the following line: ``#include <autobis_misc.h>``
-  2. Look for the following table in the same file: ``static std::vector<ChatCommand> commandTable``. Insert the row listed as "Table row" below this list.
-  3. In the same file, but below aforementioned table, insert the function labelled as "Autobis Entry Function" as a member function of the ``misc_commandscript`` class. Ideally, put this function between ``HandleAddItemSetCommand`` and ``HandleBankCommand``.
+    1. Below all the lines that start with ``#include `` at the top of the file, insert the following line: ``#include "autobis_misc.h"``
+    2. Look for the following table in the same file: ``static std::vector<ChatCommand> commandTable``. Insert the row listed as "Table row" below this list.
+    3. In the same file, but below aforementioned table, insert the function labelled as "Autobis Entry Function" as a member function of the ``misc_commandscript`` class. Ideally, put this function between ``HandleAddItemSetCommand`` and ``HandleBankCommand``.
 4. Now, open up the file ``<Path_to_your_TC_clone>/src/server/game/Accounts/RBAC.h``, search for the table named ``enum RBACPermissions``, and add the following line to the end of the table: ``RBAC_PERM_COMMAND_AUTOBIS = 1222,``
 5. Now, log into MySQL, and source the file ``insert_autobis.sql`` found in this repository.
 6. Congrats! Enjoy!
