@@ -12,7 +12,7 @@ class AutoBis {
         using ScoreWeightMap = std::map<int32, double>;
     private:
         static const ScoreWeightMap& GetScoreWeightMap(Player *player);
-        static void AdjustInvType(uint32 &inv_type);
+        static void AdjustInvType(Player* player, uint32 &inv_type);
         static double ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate);
         static bool PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate);
         static void PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, Item *item,

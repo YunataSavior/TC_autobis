@@ -6,9 +6,38 @@
 #include "DatabaseEnv.h"
 #include "ObjectMgr.h"
 #include "WorldSession.h"
+#include "SpellMgr.h"
 
 // https://github.com/Road-block/Pawn/blob/master/Wowhead.lua
 //  I subtract 20 from HIT_RATING because we tend to get flooded with hit rating, overcapping the 8% limit...
+
+// NOTE: some items have "Equip: Increase your X by Y". We need to map those auras to ITEM_MODs for the stat calc.
+//  If we're not calculating a specific stat, set RHS to INT_MIN.
+// FIXME: Is there a "smarter" way of doing this that uses code written prior? I'm having to manually encode the mappings here...
+static const std::unordered_map<int,int> SpellAuraToItemMod = {
+    {SPELL_AURA_PERIODIC_HEAL,                  ITEM_MOD_HEALTH_REGEN},
+    {SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT,     ITEM_MOD_HEALTH_REGEN}, // These function the same exact way in WOTLK.
+    {SPELL_AURA_MOD_RATING,                     ITEM_MOD_DEFENSE_SKILL_RATING},
+    {SPELL_AURA_MOD_ATTACK_POWER,               ITEM_MOD_ATTACK_POWER},
+    {SPELL_AURA_MOD_RANGED_ATTACK_POWER,        INT_MIN}, // NOTE: In WOTLK, this stat is redundant to the above.
+    {SPELL_AURA_MOD_DAMAGE_DONE,                ITEM_MOD_SPELL_POWER},
+    {SPELL_AURA_MOD_HEALING_DONE,               ITEM_MOD_SPELL_POWER}, // Hooray for WOTLK item stat changes! :D
+    {SPELL_AURA_PROC_TRIGGER_SPELL,             INT_MIN}, // Pawn doesn't rate these abilities; neither will we.
+    {SPELL_AURA_MOD_MELEE_ATTACK_POWER_VERSUS,  INT_MIN}, // Don't weigh. Example: "Do extra damage against elementals/beasts/etc.."
+    {SPELL_AURA_MOD_RANGED_ATTACK_POWER_VERSUS, INT_MIN}, // same idea as above...
+    {SPELL_AURA_MOD_FLAT_SPELL_DAMAGE_VERSUS,   INT_MIN}, // same idea...
+    {SPELL_AURA_MOD_SKILL,                      INT_MIN}, // Unimportant skill, don't weigh.
+    {SPELL_AURA_MOD_INCREASE_SWIM_SPEED,        INT_MIN}, // ditto
+    {SPELL_AURA_MOD_RESISTANCE,                 INT_MIN}, // ditto
+    {SPELL_AURA_MOD_STEALTH_LEVEL,              INT_MIN}, // ditto
+    {SPELL_AURA_DUMMY,                          INT_MIN}, // ditto
+    {SPELL_AURA_MOD_SKILL,                      INT_MIN}, // ditto
+    {SPELL_AURA_OVERRIDE_CLASS_SCRIPTS,         INT_MIN}, // ditto, but important. See: "Totem of Rage" (22395)
+    {SPELL_AURA_ADD_FLAT_MODIFIER,              INT_MIN}, // ditto, but important. See: "Idol of Ferocity" (22397)
+    {SPELL_AURA_DAMAGE_SHIELD,                  INT_MIN}, // Thorns-esque effect. Don't weigh.
+    {SPELL_AURA_MOD_POWER_REGEN,                ITEM_MOD_MANA_REGENERATION},
+    {SPELL_AURA_MOD_SHIELD_BLOCKVALUE,          ITEM_MOD_BLOCK_VALUE},
+};
 
 static const AutoBis::ScoreWeightMap ret_paladin_map = {
     {-1, 470}, // melee_DPS
@@ -34,11 +63,10 @@ static const AutoBis::ScoreWeightMap prot_paladin_map = {
     {ITEM_MOD_DEFENSE_SKILL_RATING, 45},
     {ITEM_MOD_PARRY_RATING, 30},
     {ITEM_MOD_STRENGTH, 16},
-    {8, 0.01}, // armor
+    {-2, 8}, // armor
     {ITEM_MOD_BLOCK_RATING, 7},
     {ITEM_MOD_BLOCK_VALUE, 6},
-    {-1, 0.0001}, // melee_DPS
-    {-3, 0.0001}, // ranged_DPS
+    {-1, 0.00001}, // melee_DPS
 };
 
 static const AutoBis::ScoreWeightMap fury_warrior_map = {
@@ -146,12 +174,25 @@ const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
     return ret_paladin_map;
 }
 
-void AutoBis::AdjustInvType(uint32 &inv_type)
+void AutoBis::AdjustInvType(Player* player, uint32 &inv_type)
 {
-    if (inv_type == INVTYPE_ROBE) {
+    if (inv_type == INVTYPE_WEAPONMAINHAND) {
+        // hunters can dual-wield, but there's no point..
+        if (player->GetClass() == CLASS_WARRIOR && player->GetLevel() >= 10)
+            return;
+        if (player->GetClass() == CLASS_SHAMAN && player->GetLevel() >= 40)
+            return;
+        if (player->GetClass() == CLASS_DEATH_KNIGHT)
+            return;
+        if (player->GetClass() == CLASS_ROGUE)
+            return;
+        inv_type = INVTYPE_WEAPON;
+    } else if (inv_type == INVTYPE_ROBE) {
         inv_type = INVTYPE_CHEST;
     } else if (inv_type == INVTYPE_HOLDABLE || inv_type == INVTYPE_WEAPONOFFHAND) {
         inv_type = INVTYPE_SHIELD;
+    } else if (inv_type == INVTYPE_THROWN || inv_type == INVTYPE_RANGEDRIGHT) {
+        inv_type = INVTYPE_RANGED;
     }
 }
 
@@ -159,7 +200,8 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
 {
     // ...
     uint32 itemId = itemTemplate->ItemId;
-    std::string myStm = "SELECT dmg_min1, dmg_max1, armor, StatsCount FROM item_template WHERE entry = "
+    // FIXME: Can we completely get rid of this SQL statement?
+    std::string myStm = "SELECT dmg_min1, dmg_max1 FROM item_template WHERE entry = "
                         + std::to_string(itemId) + ";";
     std::shared_ptr<ResultSet> result = WorldDatabase.Query(myStm.c_str());
     if (!result) {
@@ -169,12 +211,18 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
     Field* fields = result->Fetch();
     double dmg_min1 = fields[0].GetFloat();
     double dmg_max1 = fields[1].GetFloat();
-    uint32 armor = fields[2].GetUInt32();
-    uint32 StatsCount = fields[3].GetUInt32();
+    uint32 armor = itemTemplate->Armor;
     //
     double totalScore = 0.0, totalWeight = 0.0;
     for (auto entry : score_weights) {
         totalWeight += entry.second;
+    }
+    int block = itemTemplate->Block;
+    if (block) {
+        auto fiter = score_weights.find(ITEM_MOD_BLOCK_VALUE);
+        if (fiter != score_weights.end()) {
+            totalScore += block * fiter->second / totalWeight;
+        }
     }
     if (itemTemplate->Class == ITEM_CLASS_WEAPON) {
         double dps = 1000 * (dmg_min1 + dmg_max1) / 2 / itemTemplate->Delay;
@@ -189,12 +237,43 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
     }
     if (armor > 0 && score_weights.find(-2) != score_weights.end())
         totalScore += armor * score_weights.at(-2) / totalWeight;
-    for (int32 idx = 0; idx < StatsCount; ++idx) {
+    for (int32 idx = 0; idx < itemTemplate->StatsCount; ++idx) {
         int32 statId = itemTemplate->ItemStat[idx].ItemStatType;
         int32 statVal = itemTemplate->ItemStat[idx].ItemStatValue;
+        if (statVal <= 0)
+            continue;
         auto fiter = score_weights.find(statId);
         if (fiter != score_weights.end()) {
             totalScore += statVal * fiter->second / totalWeight;
+        }
+    }
+    // Items can also have: "Equip: Increase X by Y" attributes. These are separate:
+    for (uint32 idx = 0; idx < MAX_ITEM_PROTO_SPELLS; ++idx) {
+        uint32 spellid = itemTemplate->Spells[idx].SpellId;
+        if (spellid <= 0 || itemTemplate->Spells[idx].SpellTrigger != ITEM_SPELLTRIGGER_ON_EQUIP)
+            continue;
+        SpellInfo const* spellInfo = SpellMgr::instance()->GetSpellInfo(spellid);
+        if (!spellInfo)
+            continue; // Internal error??
+        for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
+            const SpellEffectInfo& sei = spellInfo->Effects[jdx];
+            if (sei.Effect != 6)
+                continue;
+            int value = sei.CalcValue();
+            if (value <= 0)
+                continue;
+            auto fiter2 = SpellAuraToItemMod.find(sei.ApplyAuraName);
+            if (fiter2 == SpellAuraToItemMod.end()) {
+                printf("FIXME: ApplyAuraName=%d not found. Id: %d, value = %d\n", sei.ApplyAuraName, itemId, value);
+            } else {
+                int32 statId = fiter2->second;
+                if (statId == INT_MIN)
+                    continue; // we're not weighing this Equip stat
+                auto fiter = score_weights.find(statId);
+                if (fiter != score_weights.end()) {
+                    totalScore += value * fiter->second / totalWeight;
+                }
+            }
         }
     }
     return totalScore;
@@ -226,8 +305,9 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
         if (player->GetSkillValue(item_weapon_skills[itemTemplate->SubClass]) == 0)
             return false; // player cannot equip this item
     }
-    if (itemTemplate->Class == 4) {
-        if (player->GetClass() == CLASS_WARRIOR || player->GetClass() == CLASS_PALADIN) {
+    if (itemTemplate->Class == ITEM_CLASS_ARMOR) {
+        if (player->GetClass() == CLASS_WARRIOR || player->GetClass() == CLASS_PALADIN
+            || player->GetClass() == CLASS_DEATH_KNIGHT) {
             // plate doesn't start to show up til lvl 40. Don't do checks for pal/warr/DKs..
         } else if (player->GetClass() == CLASS_SHAMAN || player->GetClass() == CLASS_HUNTER) {
             if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_PLATE)
@@ -245,6 +325,20 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
               || itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_LEATHER)
                 return false;
         }
+        // Totems, Sigils, etc need to be checked against player class:
+        if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_LIBRAM) {
+            if (player->GetClass() != CLASS_PALADIN)
+                return false;
+        } else if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_IDOL) {
+            if (player->GetClass() != CLASS_DRUID)
+                return false;
+        } else if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_TOTEM) {
+            if (player->GetClass() != CLASS_SHAMAN)
+                return false;
+        } else if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_SIGIL) {
+            if (player->GetClass() != CLASS_DEATH_KNIGHT)
+                return false;
+        }
     }
     return true;
 }
@@ -256,7 +350,7 @@ void AutoBis::PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, 
     if (!PlayerCanUseItem(player, itemTemplate))
         return;
     uint32 inv_type = itemTemplate->InventoryType;
-    AdjustInvType(inv_type);
+    AdjustInvType(player, inv_type);
     double score = ComputePawnScore(swm, itemTemplate);
     have_items[inv_type].push_back({itemTemplate, score});
 }
@@ -329,12 +423,12 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
         std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
     }
     //
-    #if 0
+#if 0
     // Test:
     //  50730: Glorenzelg, High-Blade of the Silver Hand (Heroic)
     double item_score = ComputePawnScore(50730);
     printf("50730: expected score == 215.20; got: %f\n", item_score);
-    #endif
+#endif
     std::string myStm = "SELECT entry FROM item_template WHERE (class=2 || class=4) && (Quality<=3) && "
                         "(FlagsExtra!=8192) && (ItemLevel<200) && (RequiredReputationFaction = 0) && "
                         "(SellPrice > 0) && "
@@ -364,7 +458,8 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
     ItemSlotMap next_items;
     for (ItemTemplate const* item_template : item_templates) {
         uint32 inv_type = item_template->InventoryType;
-        AdjustInvType(inv_type);
+        // In the loop prior we used "PlayerCanUseItem()", so don't use it here.
+        AdjustInvType(player, inv_type);
         SlotItems &have_si = have_items[inv_type];
         auto fiter = have_si.begin();
         for (; fiter != have_si.end(); ++fiter) {
@@ -402,6 +497,5 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
             }
         }
     }
-    //printf("item_templates.size() : %lu\n", item_templates.size());
     return true;
 }
