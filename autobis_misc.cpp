@@ -229,6 +229,8 @@ const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
 {
     if (player->GetClass() == CLASS_PALADIN)
         return prot_paladin_map;
+    else if (player->GetClass() == CLASS_HUNTER)
+        return bm_hunter_map;
     else if (player->GetClass() == CLASS_WARRIOR)
         return fury_warrior_map;
     else if (player->GetClass() == CLASS_MAGE)
@@ -244,17 +246,15 @@ const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
     return ret_paladin_map;
 }
 
+static bool CanOneDualWield(Player* player)
+{
+    return ((player->HasSpell(674) || player->HasSpell(30798)) && !player->HasSpell(46917));
+}
+
 void AutoBis::AdjustInvType(Player* player, uint32 &inv_type)
 {
     if (inv_type == INVTYPE_WEAPONMAINHAND) {
-        // hunters can dual-wield, but there's no point..
-        if (player->GetClass() == CLASS_WARRIOR && player->GetLevel() >= 10)
-            return;
-        if (player->GetClass() == CLASS_SHAMAN && player->GetLevel() >= 40)
-            return;
-        if (player->GetClass() == CLASS_DEATH_KNIGHT)
-            return;
-        if (player->GetClass() == CLASS_ROGUE)
+        if (CanOneDualWield(player))
             return;
         inv_type = INVTYPE_WEAPON;
     } else if (inv_type == INVTYPE_ROBE) {
@@ -440,9 +440,11 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
 
 bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
 {
+    bool titans_grip = player->GetClass() == CLASS_WARRIOR && player->HasSpell(46917);
     if (!itemTemplate)
         return false; // INTERNAL ERROR
     uint32 inv_type = itemTemplate->InventoryType;
+    uint32 subclass = itemTemplate->SubClass;
     if (inv_type == 0)
         return false;
     if (EQUIP_ERR_OK != player->CanUseItem(itemTemplate))
@@ -461,40 +463,43 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
             SKILL_DAGGERS,  SKILL_THROWN,   SKILL_ASSASSINATION, SKILL_CROSSBOWS, SKILL_WANDS,
             SKILL_FISHING
         }; //Copy from function Item::GetSkill()
-        if (player->GetSkillValue(item_weapon_skills[itemTemplate->SubClass]) == 0)
+        if (player->GetSkillValue(item_weapon_skills[subclass]) == 0)
             return false; // player cannot equip this item
+        // If a warrior has Titan's Grip, they can't onehand polearms nor staffs:
+        if (titans_grip && (subclass == ITEM_SUBCLASS_WEAPON_SPEAR || subclass == ITEM_SUBCLASS_WEAPON_STAFF))
+            return false;
     }
     if (itemTemplate->Class == ITEM_CLASS_ARMOR) {
         if (player->GetClass() == CLASS_WARRIOR || player->GetClass() == CLASS_PALADIN
             || player->GetClass() == CLASS_DEATH_KNIGHT) {
             // plate doesn't start to show up til lvl 40. Don't do checks for pal/warr/DKs..
         } else if (player->GetClass() == CLASS_SHAMAN || player->GetClass() == CLASS_HUNTER) {
-            if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_PLATE)
+            if (subclass == ITEM_SUBCLASS_ARMOR_PLATE)
                 return false;
-            if (player->GetLevel() < 40 && itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_MAIL)
+            if (player->GetLevel() < 40 && subclass == ITEM_SUBCLASS_ARMOR_MAIL)
                 return false;
         } else if (player->GetClass() == CLASS_DRUID || player->GetClass() == CLASS_ROGUE) {
-            if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_PLATE
-             || itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_MAIL)
+            if (subclass == ITEM_SUBCLASS_ARMOR_PLATE
+             || subclass == ITEM_SUBCLASS_ARMOR_MAIL)
                 return false;
         } else {
             // player is mage/wlock/priest:
-            if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_PLATE
-              || itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_MAIL
-              || itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_LEATHER)
+            if (subclass == ITEM_SUBCLASS_ARMOR_PLATE
+              || subclass == ITEM_SUBCLASS_ARMOR_MAIL
+              || subclass == ITEM_SUBCLASS_ARMOR_LEATHER)
                 return false;
         }
         // Totems, Sigils, etc need to be checked against player class:
-        if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_LIBRAM) {
+        if (subclass == ITEM_SUBCLASS_ARMOR_LIBRAM) {
             if (player->GetClass() != CLASS_PALADIN)
                 return false;
-        } else if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_IDOL) {
+        } else if (subclass == ITEM_SUBCLASS_ARMOR_IDOL) {
             if (player->GetClass() != CLASS_DRUID)
                 return false;
-        } else if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_TOTEM) {
+        } else if (subclass == ITEM_SUBCLASS_ARMOR_TOTEM) {
             if (player->GetClass() != CLASS_SHAMAN)
                 return false;
-        } else if (itemTemplate->SubClass == ITEM_SUBCLASS_ARMOR_SIGIL) {
+        } else if (subclass == ITEM_SUBCLASS_ARMOR_SIGIL) {
             if (player->GetClass() != CLASS_DEATH_KNIGHT)
                 return false;
         }
@@ -563,6 +568,8 @@ void AutoBis::PopulateHaveItems(Player *player, ItemSlotMap &have_items)
 bool AutoBis::Process(ChatHandler* handler, char const* args)
 {
     Player* player = handler->GetSession()->GetPlayer();
+    bool titans_grip = player->GetClass() == CLASS_WARRIOR && player->HasSpell(46917);
+    bool oh_dual = CanOneDualWield(player);
     uint8 playerLvl = player->GetLevel();
     if (playerLvl < 2)
         return true;
@@ -631,19 +638,42 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
         }
     }
     for (auto &next_slots : next_items) {
+        uint32 invtype = next_slots.first;
+        if (invtype == INVTYPE_SHIELD || invtype == INVTYPE_WEAPONMAINHAND) {
+            // Don't bother with "Main Hand" and "Shield/Offhand" items. "One Handed" items are sufficient.
+            if (oh_dual || titans_grip)
+                continue;
+        }
+        // don't give one-handed weapons to warriors with Titan's Grip
+        if (invtype == INVTYPE_WEAPON && titans_grip)
+            continue;
         SlotItems &slot_items = next_slots.second;
         assert(slot_items.size() > 0);
         std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
         ItemTemplate const* cur_have = nullptr;
         double prevscore = 0.0;
-        SlotItems &cur_items = have_items[next_slots.first];
+        SlotItems &cur_items = have_items[invtype];
         if (cur_items.size() > 0) {
             cur_have = cur_items.begin()->first;
             prevscore = cur_items.begin()->second;
         }
         ItemTemplate const* next_item_templ = slot_items.begin()->first;
         double nextscore = slot_items.begin()->second;
-        if (!cur_have || prevscore < nextscore) {
+        bool second_best = false;
+        bool use_two = (invtype == INVTYPE_FINGER || invtype == INVTYPE_TRINKET || (invtype == INVTYPE_WEAPON && oh_dual)
+                        || (invtype == INVTYPE_2HWEAPON && titans_grip));
+        // We don't beat the 1st item, but let's see if we beat the 2nd item:
+        if (cur_have && prevscore >= nextscore && use_two) {
+            // don't give duplicates:
+            if (cur_have->ItemId != next_item_templ->ItemId) {
+                if (cur_items.size() > 1) {
+                    if (cur_items[1].first->ItemId != next_item_templ->ItemId && nextscore > cur_items[1].second)
+                        second_best = true;
+                } else
+                    second_best = true;
+            }
+        }
+        if (!cur_have || prevscore < nextscore || second_best) {
             uint32 item_id = next_item_templ->ItemId;
             ItemPosCountVec dest;
             InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item_id, 1);
@@ -655,6 +685,31 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
             } else {
                 handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id, 1);
                 return false;
+            }
+            // let's see if we can add two items!
+            if (!second_best && use_two && slot_items.size() > 1) {
+                ItemTemplate const* next_next_proto = slot_items[1].first;
+                double nextnext = slot_items[1].second;
+                // We need to beat out the best item we already have (if it exists, otherwise win automatically).
+                if (cur_have) {
+                    if (next_next_proto->ItemId != cur_have->ItemId && nextnext > prevscore)
+                        second_best = true;
+                } else
+                    second_best = true;
+                if (second_best) {
+                    ItemPosCountVec dest2;
+                    uint32 item_id2 = next_next_proto->ItemId;
+                    msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest2, item_id2, 1);
+                    if (msg == EQUIP_ERR_OK) {
+                        uint32 enchId;
+                        CalculateBestRandomEnchant(swm, next_next_proto, enchId);
+                        Item* item = player->StoreNewItem(dest2, item_id2, true, enchId);
+                        player->SendNewItem(item, 1, false, true);
+                    } else {
+                        handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id2, 1);
+                        return false;
+                    }
+                }
             }
         }
     }
