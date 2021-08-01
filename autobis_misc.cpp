@@ -7,38 +7,108 @@
 #include "ObjectMgr.h"
 #include "WorldSession.h"
 #include "SpellMgr.h"
-
-// https://github.com/Road-block/Pawn/blob/master/Wowhead.lua
-//  I subtract 20 from HIT_RATING because we tend to get flooded with hit rating, overcapping the 8% limit...
+#include "DBCStores.h"
+#include "DBCStructure.h"
 
 // NOTE: some items have "Equip: Increase your X by Y". We need to map those auras to ITEM_MODs for the stat calc.
 //  If we're not calculating a specific stat, set RHS to INT_MIN.
 // FIXME: Is there a "smarter" way of doing this that uses code written prior? I'm having to manually encode the mappings here...
-static const std::unordered_map<int,int> SpellAuraToItemMod = {
-    {SPELL_AURA_PERIODIC_HEAL,                  ITEM_MOD_HEALTH_REGEN},
-    {SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT,     ITEM_MOD_HEALTH_REGEN}, // These function the same exact way in WOTLK.
-    {SPELL_AURA_MOD_RATING,                     ITEM_MOD_DEFENSE_SKILL_RATING},
-    {SPELL_AURA_MOD_ATTACK_POWER,               ITEM_MOD_ATTACK_POWER},
-    {SPELL_AURA_MOD_RANGED_ATTACK_POWER,        INT_MIN}, // NOTE: In WOTLK, this stat is redundant to the above.
-    {SPELL_AURA_MOD_DAMAGE_DONE,                ITEM_MOD_SPELL_POWER},
-    {SPELL_AURA_MOD_HEALING_DONE,               ITEM_MOD_SPELL_POWER}, // Hooray for WOTLK item stat changes! :D
-    {SPELL_AURA_PROC_TRIGGER_SPELL,             INT_MIN}, // Pawn doesn't rate these abilities; neither will we.
-    {SPELL_AURA_MOD_MELEE_ATTACK_POWER_VERSUS,  INT_MIN}, // Don't weigh. Example: "Do extra damage against elementals/beasts/etc.."
-    {SPELL_AURA_MOD_RANGED_ATTACK_POWER_VERSUS, INT_MIN}, // same idea as above...
-    {SPELL_AURA_MOD_FLAT_SPELL_DAMAGE_VERSUS,   INT_MIN}, // same idea...
-    {SPELL_AURA_MOD_SKILL,                      INT_MIN}, // Unimportant skill, don't weigh.
-    {SPELL_AURA_MOD_INCREASE_SWIM_SPEED,        INT_MIN}, // ditto
-    {SPELL_AURA_MOD_RESISTANCE,                 INT_MIN}, // ditto
-    {SPELL_AURA_MOD_STEALTH_LEVEL,              INT_MIN}, // ditto
-    {SPELL_AURA_DUMMY,                          INT_MIN}, // ditto
-    {SPELL_AURA_MOD_SKILL,                      INT_MIN}, // ditto
-    {SPELL_AURA_OVERRIDE_CLASS_SCRIPTS,         INT_MIN}, // ditto, but important. See: "Totem of Rage" (22395)
-    {SPELL_AURA_ADD_FLAT_MODIFIER,              INT_MIN}, // ditto, but important. See: "Idol of Ferocity" (22397)
-    {SPELL_AURA_DAMAGE_SHIELD,                  INT_MIN}, // Thorns-esque effect. Don't weigh.
-    {SPELL_AURA_MOD_POWER_REGEN,                ITEM_MOD_MANA_REGENERATION},
-    {SPELL_AURA_MOD_SHIELD_BLOCKVALUE,          ITEM_MOD_BLOCK_VALUE},
-};
+static int32 ModRatingToItemMod(const SpellEffectInfo& sei)
+{
+    for (int idx = 0; idx < MAX_COMBAT_RATING; ++idx) {
+        if (!(sei.MiscValue & (1 << idx)))
+            continue;
+        switch (idx) {
+            case CR_WEAPON_SKILL:
+                return INT_MIN;
+            case CR_DEFENSE_SKILL:
+                return ITEM_MOD_DEFENSE_SKILL_RATING;
+            case CR_DODGE:
+                return ITEM_MOD_DODGE_RATING;
+            case CR_PARRY:
+                return ITEM_MOD_PARRY_RATING;
+            case CR_BLOCK:
+                return ITEM_MOD_BLOCK_RATING;
+            case CR_HIT_MELEE:
+            case CR_HIT_RANGED:
+            case CR_HIT_SPELL:
+                return ITEM_MOD_HIT_RATING;
+            case CR_CRIT_MELEE:
+            case CR_CRIT_RANGED:
+            case CR_CRIT_SPELL:
+                return ITEM_MOD_CRIT_RATING;
+            case CR_HIT_TAKEN_MELEE:
+            case CR_HIT_TAKEN_RANGED:
+            case CR_HIT_TAKEN_SPELL:
+                return INT_MIN;
+            case CR_CRIT_TAKEN_MELEE:
+            case CR_CRIT_TAKEN_RANGED:
+            case CR_CRIT_TAKEN_SPELL:
+                return INT_MIN;
+            case CR_HASTE_MELEE:
+            case CR_HASTE_RANGED:
+            case CR_HASTE_SPELL:
+                return ITEM_MOD_HASTE_RATING;
+            case CR_WEAPON_SKILL_MAINHAND:
+            case CR_WEAPON_SKILL_OFFHAND:
+            case CR_WEAPON_SKILL_RANGED:
+                return INT_MIN;
+            case CR_EXPERTISE:
+                return ITEM_MOD_EXPERTISE_RATING;
+            case CR_ARMOR_PENETRATION:
+                return ITEM_MOD_ARMOR_PENETRATION_RATING;
+            default:
+                return INT_MIN;
+        }
+    }
+    return INT_MIN;
+}
+int32 SpellEffectInfoToItemMod(const SpellEffectInfo& sei)
+{
+    if (sei.Effect != 6)
+        return INT_MIN;
+    int value = sei.CalcValue();
+    if (value <= 0)
+        return INT_MIN;
+    switch (sei.ApplyAuraName) {
+        case SPELL_AURA_PERIODIC_HEAL:
+        case SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT: // These function the same exact way in WOTLK.
+            return ITEM_MOD_HEALTH_REGEN;
+        case SPELL_AURA_MOD_RATING:
+            return ModRatingToItemMod(sei);
+        case SPELL_AURA_MOD_ATTACK_POWER:
+            return ITEM_MOD_ATTACK_POWER;
+        case SPELL_AURA_MOD_RANGED_ATTACK_POWER:
+            return INT_MIN; // NOTE: In WOTLK, this stat is redundant to the above.
+        case SPELL_AURA_MOD_DAMAGE_DONE:
+        case SPELL_AURA_MOD_HEALING_DONE: // Hooray for WOTLK item stat changes! :D
+            return ITEM_MOD_SPELL_POWER;
+        case SPELL_AURA_PROC_TRIGGER_SPELL:             // Pawn doesn't rate these abilities; neither will we.
+        case SPELL_AURA_MOD_MELEE_ATTACK_POWER_VERSUS:  // Don't weigh. Example: "Do extra damage against elementals/beasts/etc.."
+        case SPELL_AURA_MOD_RANGED_ATTACK_POWER_VERSUS: // same idea as above...
+        case SPELL_AURA_MOD_FLAT_SPELL_DAMAGE_VERSUS:   // same idea...
+        case SPELL_AURA_MOD_SKILL:                      // Unimportant skill, don't weigh. But, should we?!
+        case SPELL_AURA_MOD_INCREASE_SWIM_SPEED:        // ditto...
+        case SPELL_AURA_MOD_RESISTANCE:
+        case SPELL_AURA_MOD_STEALTH_LEVEL:
+        case SPELL_AURA_DUMMY:
+        case SPELL_AURA_OVERRIDE_CLASS_SCRIPTS: // ditto, but important. See: "Totem of Rage" (22395)
+        case SPELL_AURA_ADD_FLAT_MODIFIER:      // ditto, but important. See: "Idol of Ferocity" (22397)
+        case SPELL_AURA_DAMAGE_SHIELD:          // Thorns-esque effect. Don't weigh.
+            return INT_MIN;
+        case SPELL_AURA_MOD_POWER_REGEN:
+            return ITEM_MOD_MANA_REGENERATION;
+        case SPELL_AURA_MOD_SHIELD_BLOCKVALUE:
+            return ITEM_MOD_BLOCK_VALUE;
+        default: {
+            printf("FIXME: ApplyAuraName=%d not found.\n", sei.ApplyAuraName);
+            return INT_MIN;
+        }
+    }
+}
 
+// https://github.com/Road-block/Pawn/blob/master/Wowhead.lua
+//  I subtract 20 from HIT_RATING because we tend to get flooded with hit rating, overcapping the 8% limit...
 static const AutoBis::ScoreWeightMap ret_paladin_map = {
     {-1, 470}, // melee_DPS
     {ITEM_MOD_HIT_RATING, 80},
@@ -196,6 +266,102 @@ void AutoBis::AdjustInvType(Player* player, uint32 &inv_type)
     }
 }
 
+
+//
+// see src/server/game/Entities/Item/ItemEnchantmentMgr.cpp
+//
+// Unlike GenerateItemRandomPropertyId(), we don't care about the chances (except to initially populate the unordered_map).
+typedef std::vector<uint32> EnchStoreList;
+struct AbEnchantmentStore {
+    void LoadRandomEnchantmentsTable();
+    std::unordered_map<uint32, EnchStoreList> _store;
+    bool _needs_init = true;
+};
+
+static AbEnchantmentStore randomItemEnch;
+
+void AbEnchantmentStore::LoadRandomEnchantmentsTable()
+{
+    if (!_needs_init)
+        return;
+    _needs_init = false;
+    _store.clear();
+    //                                                 0      1      2
+    QueryResult result = WorldDatabase.Query("SELECT entry, ench, chance FROM item_enchantment_template");
+    if (result) {
+        uint32 count = 0;
+        do {
+            Field* fields = result->Fetch();
+            uint32 entry = fields[0].GetUInt32();
+            uint32 ench = fields[1].GetUInt32();
+            float chance = fields[2].GetFloat();
+            if (chance > 0.000001f && chance <= 100.0f)
+                _store[entry].push_back(ench);
+            ++count;
+        } while (result->NextRow());
+    }
+}
+
+double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, ItemTemplate const* itemProto, uint32& enchId)
+{
+    randomItemEnch.LoadRandomEnchantmentsTable();
+    enchId = 0;
+    // Items with random suffixes/properties must have one of the two:
+    uint32 randprop = itemProto->RandomProperty;
+    bool do_debug = false; //(itemProto->ItemId == 8178);
+    if (randprop || itemProto->RandomSuffix) {
+        double totalWeight = 0.0;
+        for (auto entry : score_weights) {
+            totalWeight += entry.second;
+        }
+        // RandomSuffix and RandomProperty _should_ be mutually exclusive.
+        //  If, for some reason, both are set. Just take from "RandomProperty":
+        uint32 ench_idx = (randprop) ? randprop : itemProto->RandomSuffix;
+        auto riefiter = randomItemEnch._store.find(ench_idx);
+        if (riefiter == randomItemEnch._store.end())
+            return 0; // Internal error!?
+        const EnchStoreList& list = riefiter->second;
+        double best_score = -1000.0; // because we want at least 1 enchant
+        for (uint32 ench : list) {
+            double cur_score = 0;
+            ItemRandomPropertiesEntry const* propEntry = sItemRandomPropertiesStore.LookupEntry(ench);
+            if (!propEntry)
+                continue; // Internal error!?
+            for (unsigned idx = 0; idx < MAX_ITEM_ENCHANTMENT_EFFECTS; ++idx) {
+                SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(propEntry->Enchantment[idx]);
+                if (!pEnchant)
+                    continue; // Internal error!?
+                for (uint8 tt = 0; tt < MAX_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+                    if (false && do_debug) {
+                        printf("       enchId = %u, Effect = %d, EffectArg = %d, EffectPointsMin = %d\n",
+                                ench, pEnchant->Effect[tt], pEnchant->EffectArg[tt], pEnchant->EffectPointsMin[tt]);
+                    }
+                    if (pEnchant->Effect[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
+                        continue;
+                    int32 statId = pEnchant->EffectArg[tt];
+                    auto fiter = score_weights.find(statId);
+                    if (fiter != score_weights.end()) {
+                        cur_score += pEnchant->EffectPointsMin[tt] * fiter->second / totalWeight;
+                    }
+                }
+            }
+            if (do_debug)
+                printf("       enchId = %u, score = %f\n", ench, cur_score);
+            if (cur_score > best_score) {
+                enchId = ench;
+                best_score = cur_score;
+            }
+        }
+        if (best_score == -1000.0) {
+            // Internal error!? print something out..
+            enchId = GenerateItemRandomPropertyId(itemProto->ItemId);
+            return 0;
+        }
+        return best_score;
+    } else
+        return 0;
+}
+
 double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate)
 {
     // ...
@@ -257,25 +423,18 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
             continue; // Internal error??
         for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
             const SpellEffectInfo& sei = spellInfo->Effects[jdx];
-            if (sei.Effect != 6)
-                continue;
+            int statId = SpellEffectInfoToItemMod(sei);
+            if (statId == INT_MIN)
+                continue; // we're not weighing this Equip stat
             int value = sei.CalcValue();
-            if (value <= 0)
-                continue;
-            auto fiter2 = SpellAuraToItemMod.find(sei.ApplyAuraName);
-            if (fiter2 == SpellAuraToItemMod.end()) {
-                printf("FIXME: ApplyAuraName=%d not found. Id: %d, value = %d\n", sei.ApplyAuraName, itemId, value);
-            } else {
-                int32 statId = fiter2->second;
-                if (statId == INT_MIN)
-                    continue; // we're not weighing this Equip stat
-                auto fiter = score_weights.find(statId);
-                if (fiter != score_weights.end()) {
-                    totalScore += value * fiter->second / totalWeight;
-                }
+            auto fiter = score_weights.find(statId);
+            if (fiter != score_weights.end()) {
+                totalScore += value * fiter->second / totalWeight;
             }
         }
     }
+    uint32 enchId;
+    totalScore += CalculateBestRandomEnchant(score_weights, itemTemplate, enchId);
     return totalScore;
 }
 
@@ -489,7 +648,9 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
             ItemPosCountVec dest;
             InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item_id, 1);
             if (msg == EQUIP_ERR_OK) {
-                Item* item = player->StoreNewItem(dest, item_id, true, GenerateItemRandomPropertyId(item_id));
+                uint32 enchId;
+                CalculateBestRandomEnchant(swm, next_item_templ, enchId);
+                Item* item = player->StoreNewItem(dest, item_id, true, enchId);
                 player->SendNewItem(item, 1, false, true);
             } else {
                 handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id, 1);
