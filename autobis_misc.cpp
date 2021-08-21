@@ -225,11 +225,27 @@ static const AutoBis::ScoreWeightMap enh_shaman_map = {
     {-3, 0.0001}, // ranged_DPS
 };
 
+static const AutoBis::ScoreWeightMap shadow_priest_map = {
+    {ITEM_MOD_HIT_RATING, 80},
+    {ITEM_MOD_SPELL_POWER, 76},
+    {ITEM_MOD_CRIT_RATING, 54},
+    {ITEM_MOD_HASTE_RATING, 50},
+    {ITEM_MOD_SPIRIT, 16},
+    {ITEM_MOD_INTELLECT, 16},
+    {ITEM_MOD_STAMINA, 0.1},
+    {-1, 0.0001}, // melee_DPS
+    {-2, 0.0001}, // armor
+    {-3, 0.0001}, // ranged_DPS
+};
+
 const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
 {
-    if (player->GetClass() == CLASS_PALADIN)
-        return prot_paladin_map;
-    else if (player->GetClass() == CLASS_HUNTER)
+    if (player->GetClass() == CLASS_PALADIN) {
+        if (Item* offhand = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+            return prot_paladin_map;
+        else
+            return ret_paladin_map;
+    } else if (player->GetClass() == CLASS_HUNTER)
         return bm_hunter_map;
     else if (player->GetClass() == CLASS_WARRIOR)
         return fury_warrior_map;
@@ -243,6 +259,8 @@ const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
     }
     else if (player->GetClass() == CLASS_SHAMAN)
         return enh_shaman_map;
+    else if (player->GetClass() == CLASS_PRIEST)
+        return shadow_priest_map;
     return ret_paladin_map;
 }
 
