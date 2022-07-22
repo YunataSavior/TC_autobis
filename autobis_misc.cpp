@@ -154,6 +154,21 @@ static const AutoBis::ScoreWeightMap fury_warrior_map = {
     {-3, 0.0001}, // ranged_DPS
 };
 
+static const AutoBis::ScoreWeightMap combat_rogue_map = {
+    {-1, 220}, // melee_DPS
+    {ITEM_MOD_ARMOR_PENETRATION_RATING, 100},
+    {ITEM_MOD_AGILITY, 100},
+    {ITEM_MOD_EXPERTISE_RATING, 82},
+    {ITEM_MOD_HIT_RATING, 80},
+    {ITEM_MOD_CRIT_RATING, 75},
+    {ITEM_MOD_HASTE_RATING, 73},
+    {ITEM_MOD_STRENGTH, 55},
+    {ITEM_MOD_ATTACK_POWER, 50},
+    {ITEM_MOD_STAMINA, 0.1},
+    {-2, 0.01}, // armor
+    {-3, 0.0001}, // ranged_DPS
+};
+
 static const AutoBis::ScoreWeightMap frost_mage_map = {
     {ITEM_MOD_HIT_RATING, 80},
     {ITEM_MOD_HASTE_RATING, 42},
@@ -261,11 +276,17 @@ const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
         return enh_shaman_map;
     else if (player->GetClass() == CLASS_PRIEST)
         return shadow_priest_map;
+    else if (player->GetClass() == CLASS_ROGUE)
+        return combat_rogue_map;
     return ret_paladin_map;
 }
 
 static bool CanOneDualWield(Player* player)
 {
+    // Warriors: look for off hand weapon specialization:
+    if (player->GetClass() == CLASS_WARRIOR)
+        return (player->HasSpell(23584) || player->HasSpell(23585) || player->HasSpell(23586) || player->HasSpell(23587)
+             || player->HasSpell(23588));
     return ((player->HasSpell(674) || player->HasSpell(30798)) && !player->HasSpell(46917));
 }
 
@@ -432,6 +453,7 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
         }
     }
     // Items can also have: "Equip: Increase X by Y" attributes. These are separate:
+    std::unordered_set<int> seen_stat_ids;
     for (uint32 idx = 0; idx < MAX_ITEM_PROTO_SPELLS; ++idx) {
         uint32 spellid = itemTemplate->Spells[idx].SpellId;
         if (spellid <= 0 || itemTemplate->Spells[idx].SpellTrigger != ITEM_SPELLTRIGGER_ON_EQUIP)
@@ -445,6 +467,10 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
             if (statId == INT_MIN)
                 continue; // we're not weighing this Equip stat
             int value = sei.CalcValue();
+            // FIXME: For some reason, this loop will iterate the same power/value twice. Prevent this:
+            if (seen_stat_ids.find(statId) != seen_stat_ids.end())
+                continue;
+            seen_stat_ids.insert(statId);
             auto fiter = score_weights.find(statId);
             if (fiter != score_weights.end()) {
                 totalScore += value * fiter->second / totalWeight;
