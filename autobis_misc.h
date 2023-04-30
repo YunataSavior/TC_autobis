@@ -14,7 +14,7 @@ class AutoBis {
         static const ScoreWeightMap& GetScoreWeightMap(Player *player);
         static void AdjustInvType(Player* player, uint32 &inv_type);
         // return: score of the best enchant; also populates "enchid" (set to 0 if invalid):
-        static double CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, ItemTemplate const* itemProto, uint32& enchId);
+        static double CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, ItemTemplate const* itemProto, int32& enchId);
         static double ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate);
         static bool PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate);
         static void PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, Item *item,

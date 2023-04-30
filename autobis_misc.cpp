@@ -111,7 +111,7 @@ int32 SpellEffectInfoToItemMod(const SpellEffectInfo& sei)
 //  I subtract 20 from HIT_RATING because we tend to get flooded with hit rating, overcapping the 8% limit...
 static const AutoBis::ScoreWeightMap ret_paladin_map = {
     {-1, 470}, // melee_DPS
-    {ITEM_MOD_HIT_RATING, 80},
+    {ITEM_MOD_HIT_RATING, 70},
     {ITEM_MOD_STRENGTH, 80},
     {ITEM_MOD_EXPERTISE_RATING, 66},
     {ITEM_MOD_CRIT_RATING, 40},
@@ -225,7 +225,7 @@ static const AutoBis::ScoreWeightMap cat_druid_map = {
 
 static const AutoBis::ScoreWeightMap enh_shaman_map = {
     {-1, 135}, // melee_DPS
-    {ITEM_MOD_HIT_RATING, 80},
+    {ITEM_MOD_HIT_RATING, 70},
     {ITEM_MOD_EXPERTISE_RATING, 84},
     {ITEM_MOD_AGILITY, 55},
     {ITEM_MOD_INTELLECT, 55},
@@ -341,21 +341,25 @@ void AbEnchantmentStore::LoadRandomEnchantmentsTable()
     }
 }
 
-double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, ItemTemplate const* itemProto, uint32& enchId)
+double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, ItemTemplate const* itemProto, int32& enchId)
 {
     randomItemEnch.LoadRandomEnchantmentsTable();
     enchId = 0;
     // Items with random suffixes/properties must have one of the two:
-    uint32 randprop = itemProto->RandomProperty;
-    bool do_debug = false; //(itemProto->ItemId == 8178);
-    if (randprop || itemProto->RandomSuffix) {
-        double totalWeight = 0.0;
-        for (auto entry : score_weights) {
-            totalWeight += entry.second;
+    bool do_debug = false; // (itemProto->ItemId == 25117);
+    double totalWeight = 0.0;
+    for (auto entry : score_weights) {
+        totalWeight += entry.second;
+    }
+    // RandomSuffix and RandomProperty _should_ be mutually exclusive.
+    //  If, for some reason, both are set. Just take from "RandomProperty":
+    if (itemProto->RandomProperty || itemProto->RandomSuffix) {
+        bool rand_suffix = false;
+        uint32 ench_idx = itemProto->RandomProperty;
+        if (!ench_idx) {
+            ench_idx = itemProto->RandomSuffix;
+            rand_suffix = true;
         }
-        // RandomSuffix and RandomProperty _should_ be mutually exclusive.
-        //  If, for some reason, both are set. Just take from "RandomProperty":
-        uint32 ench_idx = (randprop) ? randprop : itemProto->RandomSuffix;
         auto riefiter = randomItemEnch._store.find(ench_idx);
         if (riefiter == randomItemEnch._store.end())
             return 0; // Internal error!?
@@ -363,35 +367,85 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
         double best_score = -1000.0; // because we want at least 1 enchant
         for (uint32 ench : list) {
             double cur_score = 0;
-            ItemRandomPropertiesEntry const* propEntry = sItemRandomPropertiesStore.LookupEntry(ench);
-            if (!propEntry)
-                continue; // Internal error!?
-            for (unsigned idx = 0; idx < MAX_ITEM_ENCHANTMENT_EFFECTS; ++idx) {
-                SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(propEntry->Enchantment[idx]);
-                if (!pEnchant)
+            if (!rand_suffix) {
+                ItemRandomPropertiesEntry const* propEntry = sItemRandomPropertiesStore.LookupEntry(ench);
+                if (!propEntry) {
+                    if (do_debug)
+                        printf("  ench=%u doesn't have ItemRandomPropertiesEntry?!\n", ench);
                     continue; // Internal error!?
-                for (uint8 tt = 0; tt < MAX_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
-                    if (false && do_debug) {
-                        printf("       enchId = %u, Effect = %d, EffectArg = %d, EffectPointsMin = %d\n",
-                                ench, pEnchant->Effect[tt], pEnchant->EffectArg[tt], pEnchant->EffectPointsMin[tt]);
+                }
+                for (unsigned idx = 0; idx < MAX_ITEM_ENCHANTMENT_EFFECTS; ++idx) {
+                    uint32 subench = propEntry->Enchantment[idx];
+                    SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(subench);
+                    if (!pEnchant)
+                        continue; // Internal error!?
+                    for (uint8 tt = 0; tt < MAX_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+                        if (do_debug) {
+                            printf("       enchId = %u:%u, Effect = %d, EffectArg = %d, EffectPointsMin = %d\n",
+                                    ench, subench, pEnchant->Effect[tt], pEnchant->EffectArg[tt],
+                                    pEnchant->EffectPointsMin[tt]);
+                        }
+                        if (pEnchant->Effect[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
+                            continue;
+                        int32 statId = pEnchant->EffectArg[tt];
+                        auto fiter = score_weights.find(statId);
+                        if (fiter != score_weights.end()) {
+                            cur_score += pEnchant->EffectPointsMin[tt] * fiter->second / totalWeight;
+                        }
                     }
-                    if (pEnchant->Effect[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
+                }
+            } else {
+                // Items with RandomSuffix are handled way differently than RandomProp. Suffixes are scaled based
+                //  on a scaling factor, which can be queried for. We need to calculate how much value per item:
+                ItemRandomSuffixEntry const* item_rand = sItemRandomSuffixStore.LookupEntry(ench);
+                if (!item_rand) {
+                    if (do_debug)
+                        printf("  ench=%u doesn't have ItemRandomSuffixEntry?!\n", ench);
+                    continue; // internal error?!
+                }
+                uint32 scalefact = GenerateEnchSuffixFactor(itemProto->ItemId);
+                for (int k = 0; k < MAX_ITEM_ENCHANTMENT_EFFECTS; ++k) {
+                    uint32 myEnchantment = item_rand->Enchantment[k];
+                    if (!myEnchantment)
                         continue;
-                    int32 statId = pEnchant->EffectArg[tt];
-                    auto fiter = score_weights.find(statId);
-                    if (fiter != score_weights.end()) {
-                        cur_score += pEnchant->EffectPointsMin[tt] * fiter->second / totalWeight;
+                    SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(myEnchantment);
+                    if (!pEnchant) {
+                        if (do_debug)
+                            printf("  ench=%u:%u, Enchantment=%u doesn't have pEnchant?!\n", ench_idx, ench, myEnchantment);
+                        continue;
+                    }
+                    uint32 enchant_amount = uint32((item_rand->AllocationPct[k] * scalefact) / 10000);
+                    if (do_debug) {
+                        printf("      enchId=%u:%u (%s), Enchantment = %u, AllocationPct = %u, scale = %u, amount=%u\n",
+                               ench_idx, ench, item_rand->Name[k], myEnchantment,
+                               item_rand->AllocationPct[k], scalefact, enchant_amount);
+                    }
+                    for (uint8 tt = 0; tt < MAX_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+                        if (pEnchant->Effect[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
+                            continue;
+                        if (do_debug) {
+                            printf("           Effect = %d, EffectArg = %d, EffectPointsMin = %d\n",
+                                    pEnchant->Effect[tt], pEnchant->EffectArg[tt], pEnchant->EffectPointsMin[tt]);
+                        }
+                        int32 statId = pEnchant->EffectArg[tt];
+                        auto fiter = score_weights.find(statId);
+                        if (fiter != score_weights.end()) {
+                            cur_score += enchant_amount * fiter->second / totalWeight;
+                        }
                     }
                 }
             }
             if (do_debug)
                 printf("       enchId = %u, score = %f\n", ench, cur_score);
             if (cur_score > best_score) {
-                enchId = ench;
+                if (!rand_suffix)
+                    enchId = ((int32) ench);
+                else
+                    enchId = -((int32) ench);
                 best_score = cur_score;
             }
         }
-        if (best_score == -1000.0) {
+        if (best_score <= 0) {
             // Internal error!? print something out..
             enchId = GenerateItemRandomPropertyId(itemProto->ItemId);
             return 0;
@@ -462,7 +516,7 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
         if (!spellInfo)
             continue; // Internal error??
         for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
-            const SpellEffectInfo& sei = spellInfo->Effects[jdx];
+            const SpellEffectInfo& sei = spellInfo->_effects[jdx];
             int statId = SpellEffectInfoToItemMod(sei);
             if (statId == INT_MIN)
                 continue; // we're not weighing this Equip stat
@@ -477,7 +531,7 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
             }
         }
     }
-    uint32 enchId;
+    int32 enchId;
     totalScore += CalculateBestRandomEnchant(score_weights, itemTemplate, enchId);
     return totalScore;
 }
@@ -722,7 +776,7 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
             ItemPosCountVec dest;
             InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item_id, 1);
             if (msg == EQUIP_ERR_OK) {
-                uint32 enchId;
+                int32 enchId;
                 CalculateBestRandomEnchant(swm, next_item_templ, enchId);
                 Item* item = player->StoreNewItem(dest, item_id, true, enchId);
                 player->SendNewItem(item, 1, false, true);
@@ -745,7 +799,7 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
                     uint32 item_id2 = next_next_proto->ItemId;
                     msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest2, item_id2, 1);
                     if (msg == EQUIP_ERR_OK) {
-                        uint32 enchId;
+                        int32 enchId;
                         CalculateBestRandomEnchant(swm, next_next_proto, enchId);
                         Item* item = player->StoreNewItem(dest2, item_id2, true, enchId);
                         player->SendNewItem(item, 1, false, true);
