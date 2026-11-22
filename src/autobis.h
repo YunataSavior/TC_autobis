@@ -1,8 +1,15 @@
 #ifndef __AUTOBIS_MISC_H__
 #define __AUTOBIS_MISC_H__
 
+#include <map>
+#include <utility>
+#include <vector>
+
 #include "Chat.h"
 #include "Player.h"
+
+class SpellEffectInfo;
+struct ItemTemplate;
 
 class AutoBis {
     public:
@@ -21,7 +28,7 @@ class AutoBis {
                                            ItemSlotMap &have_items, bool test_canuse);
         static void PopulateHaveItems(Player *player, ItemSlotMap &have_items);
     public:
-        static bool Process(ChatHandler* handler, char const* args);
+        static bool Process(ChatHandler* handler);
 };
 
 // returns INT_MIN if sei doesn't map in a valid fashion:

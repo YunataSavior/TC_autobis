@@ -1,14 +1,23 @@
-#include "autobis_misc.h"
+#include "autobis.h"
 
+#include <algorithm>
+#include <climits>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "Bag.h"
 #include "DatabaseEnv.h"
-#include "ObjectMgr.h"
-#include "WorldSession.h"
-#include "SpellMgr.h"
 #include "DBCStores.h"
 #include "DBCStructure.h"
+#include "Item.h"
+#include "ItemEnchantmentMgr.h"
+#include "Language.h"
+#include "Log.h"
+#include "ObjectMgr.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "WorldSession.h"
 
 // NOTE: some items have "Equip: Increase your X by Y". We need to map those auras to ITEM_MODs for the stat calc.
 //  If we're not calculating a specific stat, set RHS to INT_MIN.
@@ -65,7 +74,7 @@ static int32 ModRatingToItemMod(const SpellEffectInfo& sei)
 }
 int32 SpellEffectInfoToItemMod(const SpellEffectInfo& sei)
 {
-    if (sei.Effect != 6)
+    if (sei.Effect != SPELL_EFFECT_APPLY_AURA)
         return INT_MIN;
     int value = sei.CalcValue();
     if (value <= 0)
@@ -101,7 +110,7 @@ int32 SpellEffectInfoToItemMod(const SpellEffectInfo& sei)
         case SPELL_AURA_MOD_SHIELD_BLOCKVALUE:
             return ITEM_MOD_BLOCK_VALUE;
         default: {
-            printf("FIXME: ApplyAuraName=%d not found.\n", sei.ApplyAuraName);
+            LOG_DEBUG("module.autobis", "autobis: unhandled ApplyAuraName={}", uint32(sei.ApplyAuraName));
             return INT_MIN;
         }
     }
@@ -255,28 +264,28 @@ static const AutoBis::ScoreWeightMap shadow_priest_map = {
 
 const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
 {
-    if (player->GetClass() == CLASS_PALADIN) {
+    if (player->getClass() == CLASS_PALADIN) {
         if (Item* offhand = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
             return prot_paladin_map;
         else
             return ret_paladin_map;
-    } else if (player->GetClass() == CLASS_HUNTER)
+    } else if (player->getClass() == CLASS_HUNTER)
         return bm_hunter_map;
-    else if (player->GetClass() == CLASS_WARRIOR)
+    else if (player->getClass() == CLASS_WARRIOR)
         return fury_warrior_map;
-    else if (player->GetClass() == CLASS_MAGE)
+    else if (player->getClass() == CLASS_MAGE)
         return frost_mage_map;
-    else if (player->GetClass() == CLASS_DRUID) {
+    else if (player->getClass() == CLASS_DRUID) {
         if (player->GetLevel() < 10)
             return boomkin_map;
         else
             return cat_druid_map;
     }
-    else if (player->GetClass() == CLASS_SHAMAN)
+    else if (player->getClass() == CLASS_SHAMAN)
         return enh_shaman_map;
-    else if (player->GetClass() == CLASS_PRIEST)
+    else if (player->getClass() == CLASS_PRIEST)
         return shadow_priest_map;
-    else if (player->GetClass() == CLASS_ROGUE)
+    else if (player->getClass() == CLASS_ROGUE)
         return combat_rogue_map;
     return ret_paladin_map;
 }
@@ -284,7 +293,7 @@ const AutoBis::ScoreWeightMap& AutoBis::GetScoreWeightMap(Player *player)
 static bool CanOneDualWield(Player* player)
 {
     // Warriors: look for off hand weapon specialization:
-    if (player->GetClass() == CLASS_WARRIOR)
+    if (player->getClass() == CLASS_WARRIOR)
         return (player->HasSpell(23584) || player->HasSpell(23585) || player->HasSpell(23586) || player->HasSpell(23587)
              || player->HasSpell(23588));
     return ((player->HasSpell(674) || player->HasSpell(30798)) && !player->HasSpell(46917));
@@ -328,15 +337,13 @@ void AbEnchantmentStore::LoadRandomEnchantmentsTable()
     //                                                 0      1      2
     QueryResult result = WorldDatabase.Query("SELECT entry, ench, chance FROM item_enchantment_template");
     if (result) {
-        uint32 count = 0;
         do {
             Field* fields = result->Fetch();
-            uint32 entry = fields[0].GetUInt32();
-            uint32 ench = fields[1].GetUInt32();
-            float chance = fields[2].GetFloat();
+            uint32 entry = fields[0].Get<uint32>();
+            uint32 ench = fields[1].Get<uint32>();
+            float chance = fields[2].Get<float>();
             if (chance > 0.000001f && chance <= 100.0f)
                 _store[entry].push_back(ench);
-            ++count;
         } while (result->NextRow());
     }
 }
@@ -371,7 +378,7 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
                 ItemRandomPropertiesEntry const* propEntry = sItemRandomPropertiesStore.LookupEntry(ench);
                 if (!propEntry) {
                     if (do_debug)
-                        printf("  ench=%u doesn't have ItemRandomPropertiesEntry?!\n", ench);
+                        LOG_DEBUG("module.autobis", "  ench={} doesn't have ItemRandomPropertiesEntry", ench);
                     continue; // Internal error!?
                 }
                 for (unsigned idx = 0; idx < MAX_ITEM_ENCHANTMENT_EFFECTS; ++idx) {
@@ -379,18 +386,18 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
                     SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(subench);
                     if (!pEnchant)
                         continue; // Internal error!?
-                    for (uint8 tt = 0; tt < MAX_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+                    for (uint8 tt = 0; tt < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
                         if (do_debug) {
-                            printf("       enchId = %u:%u, Effect = %d, EffectArg = %d, EffectPointsMin = %d\n",
-                                    ench, subench, pEnchant->Effect[tt], pEnchant->EffectArg[tt],
-                                    pEnchant->EffectPointsMin[tt]);
+                            LOG_DEBUG("module.autobis", "       enchId = {}:{}, type = {}, stat = {}, amount = {}",
+                                      ench, subench, pEnchant->type[tt], pEnchant->spellid[tt],
+                                      pEnchant->amount[tt]);
                         }
-                        if (pEnchant->Effect[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
+                        if (pEnchant->type[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
                             continue;
-                        int32 statId = pEnchant->EffectArg[tt];
+                        int32 statId = pEnchant->spellid[tt];
                         auto fiter = score_weights.find(statId);
                         if (fiter != score_weights.end()) {
-                            cur_score += pEnchant->EffectPointsMin[tt] * fiter->second / totalWeight;
+                            cur_score += pEnchant->amount[tt] * fiter->second / totalWeight;
                         }
                     }
                 }
@@ -400,7 +407,7 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
                 ItemRandomSuffixEntry const* item_rand = sItemRandomSuffixStore.LookupEntry(ench);
                 if (!item_rand) {
                     if (do_debug)
-                        printf("  ench=%u doesn't have ItemRandomSuffixEntry?!\n", ench);
+                        LOG_DEBUG("module.autobis", "  ench={} doesn't have ItemRandomSuffixEntry", ench);
                     continue; // internal error?!
                 }
                 uint32 scalefact = GenerateEnchSuffixFactor(itemProto->ItemId);
@@ -411,23 +418,22 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
                     SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(myEnchantment);
                     if (!pEnchant) {
                         if (do_debug)
-                            printf("  ench=%u:%u, Enchantment=%u doesn't have pEnchant?!\n", ench_idx, ench, myEnchantment);
+                            LOG_DEBUG("module.autobis", "  ench={}:{}, Enchantment={} doesn't have pEnchant", ench_idx, ench, myEnchantment);
                         continue;
                     }
                     uint32 enchant_amount = uint32((item_rand->AllocationPct[k] * scalefact) / 10000);
                     if (do_debug) {
-                        printf("      enchId=%u:%u (%s), Enchantment = %u, AllocationPct = %u, scale = %u, amount=%u\n",
-                               ench_idx, ench, item_rand->Name[k], myEnchantment,
-                               item_rand->AllocationPct[k], scalefact, enchant_amount);
+                        LOG_DEBUG("module.autobis", "      enchId={}:{}, Enchantment = {}, AllocationPct = {}, scale = {}, amount={}",
+                              ench_idx, ench, myEnchantment, item_rand->AllocationPct[k], scalefact, enchant_amount);
                     }
-                    for (uint8 tt = 0; tt < MAX_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
-                        if (pEnchant->Effect[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
+                    for (uint8 tt = 0; tt < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+                        if (pEnchant->type[tt] != ITEM_ENCHANTMENT_TYPE_STAT)
                             continue;
                         if (do_debug) {
-                            printf("           Effect = %d, EffectArg = %d, EffectPointsMin = %d\n",
-                                    pEnchant->Effect[tt], pEnchant->EffectArg[tt], pEnchant->EffectPointsMin[tt]);
+                            LOG_DEBUG("module.autobis", "           type = {}, stat = {}, amount = {}",
+                                      pEnchant->type[tt], pEnchant->spellid[tt], pEnchant->amount[tt]);
                         }
-                        int32 statId = pEnchant->EffectArg[tt];
+                        int32 statId = pEnchant->spellid[tt];
                         auto fiter = score_weights.find(statId);
                         if (fiter != score_weights.end()) {
                             cur_score += enchant_amount * fiter->second / totalWeight;
@@ -436,7 +442,7 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
                 }
             }
             if (do_debug)
-                printf("       enchId = %u, score = %f\n", ench, cur_score);
+                LOG_DEBUG("module.autobis", "       enchId = {}, score = {}", ench, cur_score);
             if (cur_score > best_score) {
                 if (!rand_suffix)
                     enchId = ((int32) ench);
@@ -447,7 +453,7 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
         }
         if (best_score <= 0) {
             // Internal error!? print something out..
-            enchId = GenerateItemRandomPropertyId(itemProto->ItemId);
+            enchId = Item::GenerateItemRandomPropertyId(itemProto->ItemId);
             return 0;
         }
         return best_score;
@@ -458,18 +464,9 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
 double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate)
 {
     // ...
-    uint32 itemId = itemTemplate->ItemId;
-    // FIXME: Can we completely get rid of this SQL statement?
-    std::string myStm = "SELECT dmg_min1, dmg_max1 FROM item_template WHERE entry = "
-                        + std::to_string(itemId) + ";";
-    std::shared_ptr<ResultSet> result = WorldDatabase.Query(myStm.c_str());
-    if (!result) {
-        printf("INTERNAL ERROR: entry = %u not found in item_template !?\n", itemId);
-        return -1.0;
-    }
-    Field* fields = result->Fetch();
-    double dmg_min1 = fields[0].GetFloat();
-    double dmg_max1 = fields[1].GetFloat();
+    // AzerothCore keeps dmg_min1/dmg_max1 in the item template, so no per-item SQL query is needed:
+    double dmg_min1 = itemTemplate->Damage[0].DamageMin;
+    double dmg_max1 = itemTemplate->Damage[0].DamageMax;
     uint32 armor = itemTemplate->Armor;
     //
     double totalScore = 0.0, totalWeight = 0.0;
@@ -483,7 +480,7 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
             totalScore += block * fiter->second / totalWeight;
         }
     }
-    if (itemTemplate->Class == ITEM_CLASS_WEAPON) {
+    if (itemTemplate->Class == ITEM_CLASS_WEAPON && itemTemplate->Delay > 0) {
         double dps = 1000 * (dmg_min1 + dmg_max1) / 2 / itemTemplate->Delay;
         uint32 invtype = itemTemplate->InventoryType;
         if (invtype == INVTYPE_RANGED || invtype == INVTYPE_THROWN || invtype == INVTYPE_RANGEDRIGHT) {
@@ -496,7 +493,7 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
     }
     if (armor > 0 && score_weights.find(-2) != score_weights.end())
         totalScore += armor * score_weights.at(-2) / totalWeight;
-    for (int32 idx = 0; idx < itemTemplate->StatsCount; ++idx) {
+    for (uint32 idx = 0; idx < itemTemplate->StatsCount; ++idx) {
         int32 statId = itemTemplate->ItemStat[idx].ItemStatType;
         int32 statVal = itemTemplate->ItemStat[idx].ItemStatValue;
         if (statVal <= 0)
@@ -512,11 +509,11 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
         uint32 spellid = itemTemplate->Spells[idx].SpellId;
         if (spellid <= 0 || itemTemplate->Spells[idx].SpellTrigger != ITEM_SPELLTRIGGER_ON_EQUIP)
             continue;
-        SpellInfo const* spellInfo = SpellMgr::instance()->GetSpellInfo(spellid);
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellid);
         if (!spellInfo)
             continue; // Internal error??
         for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
-            const SpellEffectInfo& sei = spellInfo->_effects[jdx];
+            const SpellEffectInfo& sei = spellInfo->Effects[jdx];
             int statId = SpellEffectInfoToItemMod(sei);
             if (statId == INT_MIN)
                 continue; // we're not weighing this Equip stat
@@ -538,7 +535,7 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
 
 bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
 {
-    bool titans_grip = player->GetClass() == CLASS_WARRIOR && player->HasSpell(46917);
+    bool titans_grip = player->getClass() == CLASS_WARRIOR && player->HasSpell(46917);
     if (!itemTemplate)
         return false; // INTERNAL ERROR
     uint32 inv_type = itemTemplate->InventoryType;
@@ -549,34 +546,28 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
         return false;
     if (inv_type == INVTYPE_SHIELD) {
         // only shamans, warriors, and paladins can use shields:
-        if (player->GetClass() != CLASS_WARRIOR && player->GetClass() != CLASS_PALADIN
-            && player->GetClass() != CLASS_SHAMAN)
+        if (player->getClass() != CLASS_WARRIOR && player->getClass() != CLASS_PALADIN
+            && player->getClass() != CLASS_SHAMAN)
             return false;
     }
     if (itemTemplate->Class == ITEM_CLASS_WEAPON) {
-        const static uint32 item_weapon_skills[MAX_ITEM_SUBCLASS_WEAPON] = {
-            SKILL_AXES,     SKILL_2H_AXES,  SKILL_BOWS,          SKILL_GUNS,      SKILL_MACES,
-            SKILL_2H_MACES, SKILL_POLEARMS, SKILL_SWORDS,        SKILL_2H_SWORDS, 0,
-            SKILL_STAVES,   0,              0,                   SKILL_FIST_WEAPONS,   0,
-            SKILL_DAGGERS,  SKILL_THROWN,   SKILL_ASSASSINATION, SKILL_CROSSBOWS, SKILL_WANDS,
-            SKILL_FISHING
-        }; //Copy from function Item::GetSkill()
-        if (player->GetSkillValue(item_weapon_skills[subclass]) == 0)
+        uint32 skill = itemTemplate->GetSkill();
+        if (!skill || player->GetSkillValue(skill) == 0)
             return false; // player cannot equip this item
         // If a warrior has Titan's Grip, they can't onehand polearms nor staffs:
         if (titans_grip && (subclass == ITEM_SUBCLASS_WEAPON_SPEAR || subclass == ITEM_SUBCLASS_WEAPON_STAFF))
             return false;
     }
     if (itemTemplate->Class == ITEM_CLASS_ARMOR) {
-        if (player->GetClass() == CLASS_WARRIOR || player->GetClass() == CLASS_PALADIN
-            || player->GetClass() == CLASS_DEATH_KNIGHT) {
+        if (player->getClass() == CLASS_WARRIOR || player->getClass() == CLASS_PALADIN
+            || player->getClass() == CLASS_DEATH_KNIGHT) {
             // plate doesn't start to show up til lvl 40. Don't do checks for pal/warr/DKs..
-        } else if (player->GetClass() == CLASS_SHAMAN || player->GetClass() == CLASS_HUNTER) {
+        } else if (player->getClass() == CLASS_SHAMAN || player->getClass() == CLASS_HUNTER) {
             if (subclass == ITEM_SUBCLASS_ARMOR_PLATE)
                 return false;
             if (player->GetLevel() < 40 && subclass == ITEM_SUBCLASS_ARMOR_MAIL)
                 return false;
-        } else if (player->GetClass() == CLASS_DRUID || player->GetClass() == CLASS_ROGUE) {
+        } else if (player->getClass() == CLASS_DRUID || player->getClass() == CLASS_ROGUE) {
             if (subclass == ITEM_SUBCLASS_ARMOR_PLATE
              || subclass == ITEM_SUBCLASS_ARMOR_MAIL)
                 return false;
@@ -589,16 +580,16 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
         }
         // Totems, Sigils, etc need to be checked against player class:
         if (subclass == ITEM_SUBCLASS_ARMOR_LIBRAM) {
-            if (player->GetClass() != CLASS_PALADIN)
+            if (player->getClass() != CLASS_PALADIN)
                 return false;
         } else if (subclass == ITEM_SUBCLASS_ARMOR_IDOL) {
-            if (player->GetClass() != CLASS_DRUID)
+            if (player->getClass() != CLASS_DRUID)
                 return false;
         } else if (subclass == ITEM_SUBCLASS_ARMOR_TOTEM) {
-            if (player->GetClass() != CLASS_SHAMAN)
+            if (player->getClass() != CLASS_SHAMAN)
                 return false;
         } else if (subclass == ITEM_SUBCLASS_ARMOR_SIGIL) {
-            if (player->GetClass() != CLASS_DEATH_KNIGHT)
+            if (player->getClass() != CLASS_DEATH_KNIGHT)
                 return false;
         }
     }
@@ -606,7 +597,7 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
 }
 
 void AutoBis::PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, Item *item, ItemSlotMap &have_items,
-                                     bool test_canuse)
+                                     [[maybe_unused]] bool test_canuse)
 {
     ItemTemplate const *itemTemplate = item->GetTemplate();
     if (!PlayerCanUseItem(player, itemTemplate))
@@ -663,16 +654,16 @@ void AutoBis::PopulateHaveItems(Player *player, ItemSlotMap &have_items)
     }
 }
 
-bool AutoBis::Process(ChatHandler* handler, char const* args)
+bool AutoBis::Process(ChatHandler* handler)
 {
-    Player* player = handler->GetSession()->GetPlayer();
-    bool titans_grip = player->GetClass() == CLASS_WARRIOR && player->HasSpell(46917);
+    Player* player = handler->GetPlayer();
+    bool titans_grip = player->getClass() == CLASS_WARRIOR && player->HasSpell(46917);
     bool oh_dual = CanOneDualWield(player);
     uint8 playerLvl = player->GetLevel();
-    if (playerLvl < 2)
+    if (playerLvl < 2) {
+        handler->SendSysMessage("autobis: you must be at least level 2.");
         return true;
-    //if (!*args)
-    //    return false;
+    }
     struct ItemCompare {
         bool operator()(const ItemScore &left, const ItemScore &right) {
             return (left.second > right.second);
@@ -683,39 +674,31 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
     PopulateHaveItems(player, have_items);
     for (auto &have_slots : have_items) {
         SlotItems &slot_items = have_slots.second;
-        //printf("%u: %lu\n", have_slots.first, slot_items.size());
         std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
     }
-    //
-#if 0
-    // Test:
-    //  50730: Glorenzelg, High-Blade of the Silver Hand (Heroic)
-    double item_score = ComputePawnScore(50730);
-    printf("50730: expected score == 215.20; got: %f\n", item_score);
-#endif
-    std::string myStm = "SELECT entry FROM item_template WHERE (class=2 || class=4) && (Quality<=3) && "
-                        "(FlagsExtra!=8192) && (ItemLevel<200) && (RequiredReputationFaction = 0) && "
-                        "(SellPrice > 0) && "
-                        "(RequiredLevel=" + std::to_string(playerLvl) + ");";
+    // Same filter the TrinityCore version ran as SQL, applied to the in-memory item template store instead:
+    //   (class=2 || class=4) && Quality<=3 && !(FlagsExtra & 0x2000) && ItemLevel<200 &&
+    //   RequiredReputationFaction=0 && SellPrice>0 && RequiredLevel=<player level>
+    // Plus: skip deprecated items (e.g. "Deprecated Worn Leather Shoulderpads"). The original
+    // FlagsExtra!=8192 compare was meant to do that, but in AC's data those items carry
+    // ITEM_FLAG_DEPRECATED instead. The 0x2000 (ITEM_FLAG2_SHOW_BEFORE_DISCOVERED) bit is kept
+    // since it mostly marks monster/test items.
     std::vector<ItemTemplate const*> item_templates;
-    std::shared_ptr<ResultSet> result = WorldDatabase.Query(myStm.c_str());
-    if (!result) {
-        printf("%s\n", myStm.c_str());
-        printf("no results found (playerLvl = %u) ?!\n", playerLvl);
-        return true;
+    for (auto const& [itemId, itemTemplate] : *sObjectMgr->GetItemTemplateStore()) {
+        if (itemTemplate.Class != ITEM_CLASS_WEAPON && itemTemplate.Class != ITEM_CLASS_ARMOR)
+            continue;
+        if (itemTemplate.Quality > ITEM_QUALITY_RARE || itemTemplate.HasFlag(ITEM_FLAG_DEPRECATED)
+            || itemTemplate.HasFlag2(ITEM_FLAG2_SHOW_BEFORE_DISCOVERED)
+            || itemTemplate.ItemLevel >= 200 || itemTemplate.RequiredReputationFaction != 0
+            || itemTemplate.SellPrice == 0 || itemTemplate.RequiredLevel != playerLvl)
+            continue;
+        if (!PlayerCanUseItem(player, &itemTemplate))
+            continue;
+        item_templates.push_back(&itemTemplate);
     }
-    do {
-        Field* fields = result->Fetch();
-        uint32 item_id = fields->GetUInt32();
-        ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(item_id);
-        if (!itemTemplate) {
-            printf("INTERNAL ERROR: entry = %u not found in sObjectMgr !?\n", item_id);
-            continue;
-        }
-        if (!PlayerCanUseItem(player, itemTemplate))
-            continue;
-        item_templates.push_back(itemTemplate);
-    } while (result->NextRow());
+    // The SQL query returned rows ordered by entry; keep that order so results are deterministic:
+    std::sort(item_templates.begin(), item_templates.end(),
+              [](ItemTemplate const* l, ItemTemplate const* r) { return l->ItemId < r->ItemId; });
     if (!item_templates.size())
         return true;
     const ScoreWeightMap &swm = GetScoreWeightMap(player);
@@ -746,7 +729,7 @@ bool AutoBis::Process(ChatHandler* handler, char const* args)
         if (invtype == INVTYPE_WEAPON && titans_grip)
             continue;
         SlotItems &slot_items = next_slots.second;
-        assert(slot_items.size() > 0);
+        ASSERT(!slot_items.empty());
         std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
         ItemTemplate const* cur_have = nullptr;
         double prevscore = 0.0;

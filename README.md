@@ -1,44 +1,34 @@
 # TC_autobis
-TrinityCore custom C++ command for giving players the best items possible at any level.
+AzerothCore module (originally a TrinityCore custom command) for giving players the best items possible at any level.
 
-"autobis" is a command you can use on your own compiled installation of TrinityCore to give yourself the "best theoretical" items at any given level.
+"autobis" is a command you can use on your own compiled installation of AzerothCore to give yourself the "best theoretical" items at any given level.
 
-# Installation Instructions
+# Installation Instructions (AzerothCore)
 
-## Notes
-1. These instructions are very crude at the moment. These should work fine with any latest build of TrinityCore, but if not, please let me know.
-2. These instructions assume you are running Linux. For Windows, you can try following along, albeit you'll have to do things slightly differently.
+autobis is packaged as an AzerothCore module, so no core files need to be edited.
 
 ## Linux Instructions
-1. Download/clone this repository to your computer.
-2. Copy the files ``autobis_misc.cpp`` and ``autobis_misc.h`` to ``<Path_to_your_TC_clone>/src/server/scripts/Commands/``
-3. In that same folder, open up the file named ``cs_misc.cpp``. We're going to make the following changes to that file:
-    1. Below all the lines that start with ``#include `` at the top of the file, insert the following line: ``#include "autobis_misc.h"``
-    2. Look for the following table in the same file: ``static std::vector<ChatCommand> commandTable``. Insert the row listed as "Table row" below this list.
-    3. In the same file, but below aforementioned table, insert the function labelled as "Autobis Entry Function" as a member function of the ``misc_commandscript`` class. Ideally, put this function between ``HandleAddItemSetCommand`` and ``HandleBankCommand``.
-4. Now, open up the file ``<Path_to_your_TC_clone>/src/server/game/Accounts/RBAC.h``, search for the table named ``enum RBACPermissions``, and add the following line to the end of the table: ``RBAC_PERM_COMMAND_AUTOBIS = 1222,``
-    1. Note: put it BEFORE the following line in that table: ``RBAC_PERM_MAX``.
-5. Recompile TrinityCore with ``make rebuild_cache``, followed by ``make install``. (Tip: use the -j8 flag for the second command to speed things up).
-6. Now, log into MySQL, and source the file ``insert_autobis.sql`` found in this repository.
-    1. As a reminder, from the command line, use the following command: ``mysql -u root -p``.
-7. Congrats! Enjoy!
+1. Put this repository in your AzerothCore `modules/` directory **under the name `mod-autobis`**
+   (the module loader derives the entry-point name `Addmod_autobisScripts` from the directory name):
+   ```
+   cd <Path_to_your_azerothcore>/modules
+   git clone <this repo> mod-autobis          # or: ln -s /path/to/TC_autobis mod-autobis
+   ```
+2. Re-run CMake and rebuild/install, e.g. from your build directory:
+   ```
+   cmake .. <your usual flags>
+   make -j$(nproc) && make install
+   ```
+3. Start `worldserver`. With database auto-updates enabled (the default `Updates.EnableDatabases`), the file
+   `data/sql/db-world/autobis_command.sql` is applied to the world database automatically; it only adds the
+   help text for `.help autobis`. If you have auto-updates disabled, source that file into `acore_world` manually.
+4. Congrats! Enjoy!
 
-NOTE: If TrinityCore ends up using "1222" for another command down the line, please let me know ASAP. I chose this number because it's far greater than whatever other number is being used currently, but you never know....
+The command requires GM security level (`SEC_GAMEMASTER`, i.e. account `gmlevel` 2 or higher).
+No auth-database / permission changes are needed.
 
-# Code you need to insert yourself
-
-## Table row
-```
-{ "autobis",          HandleAutoBisCommand,          rbac::RBAC_PERM_COMMAND_AUTOBIS,          Console::No },
-```
-
-## Autobis Entry Function
-```
-    static bool HandleAutoBisCommand(ChatHandler* handler, char const* args)
-    {
-        return AutoBis::Process(handler, args);
-    }
-```
+## TrinityCore
+The original TrinityCore version of these instructions (patching `cs_misc.cpp` and `RBAC.h`) lives on the `main` branch.
 
 # How to use
 In-game, provided you are at:
@@ -60,7 +50,7 @@ If you don't understand the code, or don't want to, let me summarize how autobis
 * It will also loop over all items that you don't have that have a "Requires Level X" equal to your current level.
 * If then computes a "score" for each of the aforementioned items based on stat weights. These stat weights were generated via "Pawn" scores. These scores can be found here:
   * https://github.com/Road-block/Pawn/blob/master/Wowhead.lua
-  * Stat weights are (currently) class-based. It'll (currently) use a hard-coded C++ table to translate stats to points. See ``autobis_misc.cpp`` to view the code yourself.
+  * Stat weights are (currently) class-based. It'll (currently) use a hard-coded C++ table to translate stats to points. See ``src/autobis.cpp`` to view the code yourself.
 * Using these scores, the server will compare the item you currently have versus available items you don't have on a per-slot basis.
 * If the "don't have" item has a higher score, then the server will add that item to your inventory.
 * You can thus equip your new item and become a lot stronger!
@@ -89,4 +79,4 @@ If you don't understand the code, or don't want to, let me summarize how autobis
 If you want to disable any of these design decisions, you can always modify the code.
 
 # License
-I pretty much used the same exact license agreement as does the base TrinityCore repository. Feel free to copy, modify, or do whatever you wish with this software. I give the TrinityCore team permission to integrate this command into the source code (if they ever think this command would be valuable to have).
+I pretty much used the same exact license agreement as does the base TrinityCore repository. Feel free to copy, modify, or do whatever you wish with this software. I give the TrinityCore and AzerothCore teams permission to integrate this command into the source code (if they ever think this command would be valuable to have).
