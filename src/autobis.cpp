@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -148,8 +149,9 @@ static const AutoBis::ScoreWeightMap prot_paladin_map = {
     {-1, 0.00001}, // melee_DPS
 };
 
+// I halved the expertise rating, as otherwise gems will only default to expertise
 static const AutoBis::ScoreWeightMap fury_warrior_map = {
-    {ITEM_MOD_EXPERTISE_RATING, 100},
+    {ITEM_MOD_EXPERTISE_RATING, 50},
     {ITEM_MOD_STRENGTH, 82},
     {ITEM_MOD_CRIT_RATING, 66},
     {ITEM_MOD_AGILITY, 53},
@@ -461,7 +463,374 @@ double AutoBis::CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, 
         return 0;
 }
 
-double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate)
+//
+// Gems
+//
+
+static double TotalWeight(const AutoBis::ScoreWeightMap& swm)
+{
+    double totalWeight = 0.0;
+    for (auto const& entry : swm)
+        totalWeight += entry.second;
+    return totalWeight;
+}
+
+// Score of a single SpellItemEnchantment (gem, socket bonus), using the same weights as item stats.
+static double ScoreEnchantment(const AutoBis::ScoreWeightMap& swm, uint32 enchId)
+{
+    if (!enchId)
+        return 0.0;
+    SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(enchId);
+    double totalWeight = TotalWeight(swm);
+    if (!pEnchant || totalWeight <= 0.0)
+        return 0.0;
+    double score = 0.0;
+    for (uint8 tt = 0; tt < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+        if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_STAT) {
+            auto fiter = swm.find(int32(pEnchant->spellid[tt]));
+            if (fiter != swm.end())
+                score += pEnchant->amount[tt] * fiter->second / totalWeight;
+        } else if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_EQUIP_SPELL) {
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(pEnchant->spellid[tt]);
+            if (!spellInfo)
+                continue;
+            // Spell power spells carry both "damage done" and "healing done" effects; count once.
+            std::unordered_set<int32> seen;
+            for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
+                int32 statId = SpellEffectInfoToItemMod(spellInfo->Effects[jdx]);
+                if (statId == INT_MIN || !seen.insert(statId).second)
+                    continue;
+                auto fiter = swm.find(statId);
+                if (fiter != swm.end())
+                    score += spellInfo->Effects[jdx].CalcValue() * fiter->second / totalWeight;
+            }
+        }
+    }
+    return score;
+}
+
+// Can the player use this gem at all (level, skill, not unique/limited)? Fills "out" if so.
+// Meta gems: always presume the player has enough colors to activate them, and make sure a meta
+//  socket always wins (head gear with a meta gem beats head gear without). The advised meta for the
+//  class/spec beats any other meta, and a meta that's already socketed beats both (it may have been
+//  chosen by the player, e.g. a bear druid socketing a tank meta).
+static constexpr double META_SCORE = 1000000.0;
+
+bool AutoBis::GemUsableBy(Player* player, ItemTemplate const* gem, GemCandidate& out, const ScoreWeightMap& swm,
+                          uint32 recMeta)
+{
+    if (!gem || gem->Class != ITEM_CLASS_GEM || !gem->GemProperties)
+        return false;
+    GemPropertiesEntry const* gemProps = sGemPropertiesStore.LookupEntry(gem->GemProperties);
+    if (!gemProps || !gemProps->spellitemenchantement || !gemProps->color)
+        return false;
+    // Keep it simple: no unique-equipped or limit-category (e.g. jewelcrafter-only) gems.
+    if (gem->HasFlag(ITEM_FLAG_UNIQUE_EQUIPPABLE) || gem->ItemLimitCategory)
+        return false;
+    if (gem->HasFlag(ITEM_FLAG_DEPRECATED) || gem->HasFlag2(ITEM_FLAG2_SHOW_BEFORE_DISCOVERED))
+        return false;
+    // No item level gating: any gem up to WotLK may be used (e.g. TBC gear gets WotLK gems), as long
+    //  as the game's own requirements (required level/skill, enchant required level) allow it.
+    if (player->CanUseItem(gem) != EQUIP_ERR_OK)
+        return false;
+    SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(gemProps->spellitemenchantement);
+    if (!pEnchant || pEnchant->requiredLevel > player->GetLevel())
+        return false;
+    if (pEnchant->requiredSkill && player->GetSkillValue(pEnchant->requiredSkill) < pEnchant->requiredSkillValue)
+        return false;
+    out.gem = gem;
+    out.enchId = gemProps->spellitemenchantement;
+    out.color = gemProps->color;
+    out.score = ScoreEnchantment(swm, out.enchId);
+    if (out.color & SOCKET_COLOR_META)
+        out.score += (gem->ItemId == recMeta) ? 2 * META_SCORE : META_SCORE;
+    return true;
+}
+
+// Which talent tree has the most points? -1 if no talents spent (then use the class fallback).
+static int8 InferTalentTree(Player* player)
+{
+    if (player->CalculateTalentsPoints() <= player->GetFreeTalentPoints())
+        return -1;
+    return int8(player->GetMostPointsTalentTree());
+}
+
+// Meta gems people advise per class/spec. Each list is in order of preference: WotLK first, then the
+//  TBC equivalent as a fallback in case the WotLK one isn't usable.
+static std::vector<uint32> const& AdvisedMetaGems(Player* player)
+{
+    static const std::vector<uint32> physical = {41398 /* Relentless Earthsiege */, 32409 /* Relentless Earthstorm */};
+    static const std::vector<uint32> tank     = {41380 /* Austere Earthsiege */,    25896 /* Powerful Earthstorm */};
+    static const std::vector<uint32> caster   = {41285 /* Chaotic Skyflare */,      34220 /* Chaotic Skyfire */};
+    static const std::vector<uint32> healer   = {41401 /* Insightful Earthsiege */, 25901 /* Insightful Earthstorm */};
+    static const std::vector<uint32> hot_heal = {41376 /* Revitalizing Skyflare */, 25901 /* Insightful Earthstorm */};
+    int8 tree = InferTalentTree(player); // talent tab page: 0, 1, 2
+    switch (player->getClass()) {
+        case CLASS_WARRIOR:      // Arms, Fury, Protection
+            return tree == 2 ? tank : physical;
+        case CLASS_PALADIN:      // Holy, Protection, Retribution
+            if (tree == 0) return healer;
+            if (tree == 1) return tank;
+            return physical;
+        case CLASS_DEATH_KNIGHT: // Blood, Frost, Unholy
+            return tree == 0 ? tank : physical;
+        case CLASS_PRIEST:       // Discipline, Holy, Shadow
+            if (tree == 0) return healer;
+            if (tree == 1) return hot_heal;
+            return caster;
+        case CLASS_SHAMAN:       // Elemental, Enhancement, Restoration
+            if (tree == 0) return caster;
+            if (tree == 2) return hot_heal;
+            return physical;     // fallback matches the enhancement weight map
+        case CLASS_DRUID:        // Balance, Feral, Restoration
+            if (tree == 0) return caster;
+            if (tree == 2) return hot_heal;
+            return physical;     // fallback matches the cat weight map
+        case CLASS_MAGE:
+        case CLASS_WARLOCK:
+            return caster;
+        default:                 // Hunter, Rogue
+            return physical;
+    }
+}
+
+uint32 AutoBis::RecommendedMetaGem(Player* player, const ScoreWeightMap& swm)
+{
+    for (uint32 gemId : AdvisedMetaGems(player)) {
+        GemCandidate cand;
+        if (GemUsableBy(player, sObjectMgr->GetItemTemplate(gemId), cand, swm, gemId))
+            return gemId;
+    }
+    return 0;
+}
+
+// Gems autobis may hand out for free: uncommon/rare (no epics).
+AutoBis::GemPool AutoBis::BuildGemPool(Player* player, const ScoreWeightMap& swm, uint32 recMeta)
+{
+    GemPool pool;
+    for (auto const& [itemId, gemTemplate] : *sObjectMgr->GetItemTemplateStore()) {
+        if (gemTemplate.Class != ITEM_CLASS_GEM)
+            continue;
+        if (gemTemplate.Quality > ITEM_QUALITY_RARE && itemId != recMeta)
+            continue;
+        GemCandidate cand;
+        if (!GemUsableBy(player, &gemTemplate, cand, swm, recMeta) || cand.score <= 0.0)
+            continue;
+        cand.source = GemSource::Pool;
+        pool.push_back(cand);
+    }
+    // Deterministic tie-breaking:
+    std::sort(pool.begin(), pool.end(),
+              [](GemCandidate const& l, GemCandidate const& r) { return l.gem->ItemId < r.gem->ItemId; });
+    return pool;
+}
+
+static void ForEachOwnedItem(Player* player, std::function<void(Item*)> const& fn)
+{
+    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+        if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+            fn(item);
+    for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; i++)
+        if (Bag* bag = player->GetBagByPos(i))
+            for (uint32 j = 0; j < bag->GetBagSize(); j++)
+                if (Item* item = bag->GetItemByPos(j))
+                    fn(item);
+    for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_BAG_END; i++)
+        if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+            fn(item);
+    for (uint8 i = BANK_SLOT_ITEM_START; i < BANK_SLOT_ITEM_END; i++)
+        if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+            fn(item);
+    for (uint8 i = BANK_SLOT_BAG_START; i < BANK_SLOT_BAG_END; i++)
+        if (Bag* bag = player->GetBagByPos(i))
+            for (uint32 j = 0; j < bag->GetBagSize(); j++)
+                if (Item* item = bag->GetItemByPos(j))
+                    fn(item);
+}
+
+// Gems the player already owns (any quality, e.g. epics from the AH). These get consumed when used.
+AutoBis::GemPool AutoBis::BuildOwnedGems(Player* player, const ScoreWeightMap& swm, OwnedGemCounts& counts,
+                                         uint32 recMeta)
+{
+    counts.clear();
+    ForEachOwnedItem(player, [&counts](Item* item) {
+        if (item->GetTemplate()->Class == ITEM_CLASS_GEM && !item->IsInTrade())
+            counts[item->GetEntry()] += item->GetCount();
+    });
+    GemPool owned;
+    for (auto const& [gemId, count] : counts) {
+        GemCandidate cand;
+        if (!GemUsableBy(player, sObjectMgr->GetItemTemplate(gemId), cand, swm, recMeta) || cand.score <= 0.0)
+            continue;
+        cand.source = GemSource::Owned;
+        owned.push_back(cand);
+    }
+    return owned;
+}
+
+static bool GemFitsSocket(uint32 socketColor, uint32 gemColor)
+{
+    // Meta sockets only take meta gems, and meta gems only go in meta sockets:
+    if (socketColor & SOCKET_COLOR_META)
+        return (gemColor & SOCKET_COLOR_META) != 0;
+    return !(gemColor & SOCKET_COLOR_META);
+}
+
+// Pick gems for every socket of "proto". Two layouts:
+//  (a) every gem matches its socket color (pure or mixed, e.g. orange fits red and yellow), so the
+//      socket bonus is earned. This is always used when possible;
+//  (b) otherwise, the best-scoring gem in every socket.
+// "owned" gems are limited by "ownedCounts"; "current" are the gems already in this item (kept if best).
+AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate const* proto, GemPool const& pool,
+                                      GemPool const* owned, OwnedGemCounts const* ownedCounts,
+                                      std::array<GemCandidate, 3> const* current)
+{
+    GemPlan best;
+    bool have_best = false;
+    for (int pass = 0; pass < 2; ++pass) {
+        bool match_colors = (pass == 0);
+        OwnedGemCounts counts = ownedCounts ? *ownedCounts : OwnedGemCounts();
+        GemPlan plan;
+        bool valid = true, all_match = true, has_socket = false;
+        for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i) {
+            uint32 socketColor = proto->Socket[i].Color;
+            if (!socketColor)
+                continue;
+            has_socket = true;
+            GemCandidate const* pick = nullptr;
+            auto consider = [&](GemCandidate const& cand) {
+                if (!cand.gem || !GemFitsSocket(socketColor, cand.color))
+                    return;
+                if (match_colors && !(socketColor & cand.color))
+                    return;
+                if (cand.source == GemSource::Owned && counts[cand.gem->ItemId] == 0)
+                    return;
+                // strictly better only: ties prefer what's already socketed, then free gems, then owned.
+                if (!pick || cand.score > pick->score)
+                    pick = &cand;
+            };
+            if (current)
+                consider((*current)[i]);
+            for (GemCandidate const& cand : pool)
+                consider(cand);
+            if (owned)
+                for (GemCandidate const& cand : *owned)
+                    consider(cand);
+            if (!pick) {
+                if (match_colors)
+                    valid = false;
+                all_match = false;
+                continue;
+            }
+            if (pick->source == GemSource::Owned)
+                --counts[pick->gem->ItemId];
+            if (!(socketColor & pick->color))
+                all_match = false;
+            plan.gems[i] = *pick;
+            plan.score += pick->score;
+        }
+        if (!has_socket)
+            return GemPlan();
+        if (!valid)
+            continue;
+        if (all_match) {
+            plan.score += ScoreEnchantment(swm, proto->socketBonus);
+            plan.bonus = true;
+        }
+        if (match_colors)
+            return plan; // always activate the socket bonus when we can
+        if (!have_best || plan.score > best.score) {
+            best = plan;
+            have_best = true;
+        }
+    }
+    return best;
+}
+
+// Socket the best gems into "item", replacing worse ones. Mirrors WorldSession::HandleSocketOpcode.
+uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& swm, GemPool const& pool,
+                            GemPool const& owned, OwnedGemCounts& ownedCounts, uint32 recMeta)
+{
+    ItemTemplate const* proto = item->GetTemplate();
+    bool has_socket = false;
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i)
+        has_socket |= proto->Socket[i].Color != 0;
+    if (!has_socket)
+        return 0;
+    // What's in there now:
+    std::array<GemCandidate, 3> current{};
+    double current_score = 0.0;
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i) {
+        uint32 enchId = item->GetEnchantmentId(EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + i));
+        SpellItemEnchantmentEntry const* pEnchant = enchId ? sSpellItemEnchantmentStore.LookupEntry(enchId) : nullptr;
+        if (!pEnchant)
+            continue;
+        ItemTemplate const* gemProto = sObjectMgr->GetItemTemplate(pEnchant->GemID);
+        GemPropertiesEntry const* gemProps = gemProto ? sGemPropertiesStore.LookupEntry(gemProto->GemProperties) : nullptr;
+        if (!gemProps)
+            continue;
+        current[i].gem = gemProto;
+        current[i].enchId = enchId;
+        current[i].color = gemProps->color;
+        current[i].score = ScoreEnchantment(swm, enchId);
+        if (current[i].color & SOCKET_COLOR_META)
+            current[i].score += 3 * META_SCORE; // keep whatever meta is already socketed
+        current[i].source = GemSource::Current;
+        current_score += current[i].score;
+    }
+    bool current_bonus = item->GemsFitSockets();
+    if (current_bonus)
+        current_score += ScoreEnchantment(swm, proto->socketBonus);
+
+    GemPlan plan = PlanSockets(swm, proto, pool, &owned, &ownedCounts, &current);
+    // Re-gem if it scores better, or if it activates the socket bonus without destroying any epic
+    //  (or better) gem the player socketed themselves. Never downgrade otherwise.
+    bool replaces_epic = false;
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i) {
+        if (current[i].gem && plan.gems[i].source != GemSource::Current && current[i].gem->Quality > ITEM_QUALITY_RARE)
+            replaces_epic = true;
+    }
+    bool better = plan.score > current_score + 1e-9;
+    bool gains_bonus = plan.bonus && !current_bonus && !replaces_epic;
+    if (!better && !gains_bonus)
+        return 0;
+
+    bool equipped = item->IsEquipped();
+    uint8 slot = item->GetSlot();
+    if (equipped)
+        player->ToggleMetaGemsActive(slot, false);
+    for (uint32 es = SOCK_ENCHANTMENT_SLOT; es < SOCK_ENCHANTMENT_SLOT + MAX_GEM_SOCKETS; ++es)
+        player->ApplyEnchantment(item, EnchantmentSlot(es), false);
+    player->ApplyEnchantment(item, BONUS_ENCHANTMENT_SLOT, false);
+
+    uint32 socketed = 0;
+    for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i) {
+        GemCandidate const& gem = plan.gems[i];
+        if (!gem.gem || gem.source == GemSource::Current)
+            continue;
+        item->SetEnchantment(EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + i), gem.enchId, 0, 0, player->GetGUID());
+        if (gem.source == GemSource::Owned) {
+            player->DestroyItemCount(gem.gem->ItemId, 1, true);
+            --ownedCounts[gem.gem->ItemId];
+        }
+        ++socketed;
+    }
+
+    for (uint32 es = SOCK_ENCHANTMENT_SLOT; es < SOCK_ENCHANTMENT_SLOT + MAX_GEM_SOCKETS; ++es)
+        player->ApplyEnchantment(item, EnchantmentSlot(es), true);
+    item->SetEnchantment(BONUS_ENCHANTMENT_SLOT, item->GemsFitSockets() ? proto->socketBonus : 0, 0, 0, player->GetGUID());
+    player->ApplyEnchantment(item, BONUS_ENCHANTMENT_SLOT, true);
+    if (equipped)
+        player->ToggleMetaGemsActive(slot, true);
+
+    player->RemoveTradeableItem(item);
+    item->ClearSoulboundTradeable(player);
+    item->SendUpdateSockets();
+    return socketed;
+}
+
+double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate,
+                                 GemPool const* gems)
 {
     // ...
     // AzerothCore keeps dmg_min1/dmg_max1 in the item template, so no per-item SQL query is needed:
@@ -530,6 +899,10 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
     }
     int32 enchId;
     totalScore += CalculateBestRandomEnchant(score_weights, itemTemplate, enchId);
+    // Sockets: score the item as if it had the best free (uncommon/rare) gems, so socketed items
+    //  are compared fairly against unsocketed ones.
+    if (gems)
+        totalScore += PlanSockets(score_weights, itemTemplate, *gems, nullptr, nullptr, nullptr).score;
     return totalScore;
 }
 
@@ -597,61 +970,21 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
 }
 
 void AutoBis::PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, Item *item, ItemSlotMap &have_items,
-                                     [[maybe_unused]] bool test_canuse)
+                                     GemPool const* gems)
 {
     ItemTemplate const *itemTemplate = item->GetTemplate();
     if (!PlayerCanUseItem(player, itemTemplate))
         return;
     uint32 inv_type = itemTemplate->InventoryType;
     AdjustInvType(player, inv_type);
-    double score = ComputePawnScore(swm, itemTemplate);
+    double score = ComputePawnScore(swm, itemTemplate, gems);
     have_items[inv_type].push_back({itemTemplate, score});
 }
 
-void AutoBis::PopulateHaveItems(Player *player, ItemSlotMap &have_items)
+void AutoBis::PopulateHaveItems(Player *player, ItemSlotMap &have_items, GemPool const* gems)
 {
     const ScoreWeightMap &swm = GetScoreWeightMap(player);
-    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i) {
-        Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
-        if (!item)
-            continue;
-        PopulateSingleHaveItem(player, swm, item, have_items, true);
-    }
-    for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; i++) {
-        Bag* bag = player->GetBagByPos(i);
-        if (!bag)
-            continue;
-        for (uint32 j = 0; j < bag->GetBagSize(); j++) {
-            Item* item = bag->GetItemByPos(j);
-            if (!item)
-                continue;
-            PopulateSingleHaveItem(player, swm, item, have_items, true);
-        }
-    }
-    for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_BAG_END; i++) {
-        Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
-        if (!item)
-            continue;
-        PopulateSingleHaveItem(player, swm, item, have_items, true);
-    }
-    for (uint8 i = BANK_SLOT_ITEM_START; i < BANK_SLOT_ITEM_END; i++) {
-        Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
-        if (!item)
-            continue;
-        PopulateSingleHaveItem(player, swm, item, have_items, true);
-    }
-    // in bank bags
-    for (uint8 i = BANK_SLOT_BAG_START; i < BANK_SLOT_BAG_END; i++) {
-        Bag* bag = player->GetBagByPos(i);
-        if (!bag)
-            continue;
-        for (uint32 j = 0; j < bag->GetBagSize(); j++) {
-            Item* item = bag->GetItemByPos(j);
-            if (!item)
-                continue;
-            PopulateSingleHaveItem(player, swm, item, have_items, true);
-        }
-    }
+    ForEachOwnedItem(player, [&](Item* item) { PopulateSingleHaveItem(player, swm, item, have_items, gems); });
 }
 
 bool AutoBis::Process(ChatHandler* handler)
@@ -669,9 +1002,13 @@ bool AutoBis::Process(ChatHandler* handler)
             return (left.second > right.second);
         }
     };
+    const ScoreWeightMap &swm = GetScoreWeightMap(player);
+    // Free gems autobis may socket (uncommon/rare). Also used to score socketed items fairly:
+    uint32 rec_meta = RecommendedMetaGem(player, swm);
+    GemPool gem_pool = BuildGemPool(player, swm, rec_meta);
     // First, populate "have_items" map with player's inventory + bank:
     ItemSlotMap have_items;
-    PopulateHaveItems(player, have_items);
+    PopulateHaveItems(player, have_items, &gem_pool);
     for (auto &have_slots : have_items) {
         SlotItems &slot_items = have_slots.second;
         std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
@@ -699,9 +1036,6 @@ bool AutoBis::Process(ChatHandler* handler)
     // The SQL query returned rows ordered by entry; keep that order so results are deterministic:
     std::sort(item_templates.begin(), item_templates.end(),
               [](ItemTemplate const* l, ItemTemplate const* r) { return l->ItemId < r->ItemId; });
-    if (!item_templates.size())
-        return true;
-    const ScoreWeightMap &swm = GetScoreWeightMap(player);
     ItemSlotMap next_items;
     for (ItemTemplate const* item_template : item_templates) {
         uint32 inv_type = item_template->InventoryType;
@@ -714,85 +1048,122 @@ bool AutoBis::Process(ChatHandler* handler)
                 break;
         }
         if (fiter == have_si.end()) {
-            double score = ComputePawnScore(swm, item_template);
+            double score = ComputePawnScore(swm, item_template, &gem_pool);
             next_items[inv_type].push_back({item_template, score});
         }
     }
-    for (auto &next_slots : next_items) {
-        uint32 invtype = next_slots.first;
-        if (invtype == INVTYPE_SHIELD || invtype == INVTYPE_WEAPONMAINHAND) {
-            // Don't bother with "Main Hand" and "Shield/Offhand" items. "One Handed" items are sufficient.
-            if (oh_dual || titans_grip)
+    std::vector<Item*> new_items;
+    auto grant_items = [&]() -> bool {
+        for (auto &next_slots : next_items) {
+            uint32 invtype = next_slots.first;
+            if (invtype == INVTYPE_SHIELD || invtype == INVTYPE_WEAPONMAINHAND) {
+                // Don't bother with "Main Hand" and "Shield/Offhand" items. "One Handed" items are sufficient.
+                if (oh_dual || titans_grip)
+                    continue;
+            }
+            // don't give one-handed weapons to warriors with Titan's Grip
+            if (invtype == INVTYPE_WEAPON && titans_grip)
                 continue;
-        }
-        // don't give one-handed weapons to warriors with Titan's Grip
-        if (invtype == INVTYPE_WEAPON && titans_grip)
-            continue;
-        SlotItems &slot_items = next_slots.second;
-        ASSERT(!slot_items.empty());
-        std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
-        ItemTemplate const* cur_have = nullptr;
-        double prevscore = 0.0;
-        SlotItems &cur_items = have_items[invtype];
-        if (cur_items.size() > 0) {
-            cur_have = cur_items.begin()->first;
-            prevscore = cur_items.begin()->second;
-        }
-        ItemTemplate const* next_item_templ = slot_items.begin()->first;
-        double nextscore = slot_items.begin()->second;
-        bool second_best = false;
-        bool use_two = (invtype == INVTYPE_FINGER || invtype == INVTYPE_TRINKET || (invtype == INVTYPE_WEAPON && oh_dual)
-                        || (invtype == INVTYPE_2HWEAPON && titans_grip));
-        // We don't beat the 1st item, but let's see if we beat the 2nd item:
-        if (cur_have && prevscore >= nextscore && use_two) {
-            // don't give duplicates:
-            if (cur_have->ItemId != next_item_templ->ItemId) {
-                if (cur_items.size() > 1) {
-                    if (cur_items[1].first->ItemId != next_item_templ->ItemId && nextscore > cur_items[1].second)
-                        second_best = true;
-                } else
-                    second_best = true;
+            SlotItems &slot_items = next_slots.second;
+            ASSERT(!slot_items.empty());
+            std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
+            ItemTemplate const* cur_have = nullptr;
+            double prevscore = 0.0;
+            SlotItems &cur_items = have_items[invtype];
+            if (cur_items.size() > 0) {
+                cur_have = cur_items.begin()->first;
+                prevscore = cur_items.begin()->second;
             }
-        }
-        if (!cur_have || prevscore < nextscore || second_best) {
-            uint32 item_id = next_item_templ->ItemId;
-            ItemPosCountVec dest;
-            InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item_id, 1);
-            if (msg == EQUIP_ERR_OK) {
-                int32 enchId;
-                CalculateBestRandomEnchant(swm, next_item_templ, enchId);
-                Item* item = player->StoreNewItem(dest, item_id, true, enchId);
-                player->SendNewItem(item, 1, false, true);
-            } else {
-                handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id, 1);
-                return false;
-            }
-            // let's see if we can add two items!
-            if (!second_best && use_two && slot_items.size() > 1) {
-                ItemTemplate const* next_next_proto = slot_items[1].first;
-                double nextnext = slot_items[1].second;
-                // We need to beat out the best item we already have (if it exists, otherwise win automatically).
-                if (cur_have) {
-                    if (next_next_proto->ItemId != cur_have->ItemId && nextnext > prevscore)
+            ItemTemplate const* next_item_templ = slot_items.begin()->first;
+            double nextscore = slot_items.begin()->second;
+            bool second_best = false;
+            bool use_two = (invtype == INVTYPE_FINGER || invtype == INVTYPE_TRINKET || (invtype == INVTYPE_WEAPON && oh_dual)
+                            || (invtype == INVTYPE_2HWEAPON && titans_grip));
+            // We don't beat the 1st item, but let's see if we beat the 2nd item:
+            if (cur_have && prevscore >= nextscore && use_two) {
+                // don't give duplicates:
+                if (cur_have->ItemId != next_item_templ->ItemId) {
+                    if (cur_items.size() > 1) {
+                        if (cur_items[1].first->ItemId != next_item_templ->ItemId && nextscore > cur_items[1].second)
+                            second_best = true;
+                    } else
                         second_best = true;
-                } else
-                    second_best = true;
-                if (second_best) {
-                    ItemPosCountVec dest2;
-                    uint32 item_id2 = next_next_proto->ItemId;
-                    msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest2, item_id2, 1);
-                    if (msg == EQUIP_ERR_OK) {
-                        int32 enchId;
-                        CalculateBestRandomEnchant(swm, next_next_proto, enchId);
-                        Item* item = player->StoreNewItem(dest2, item_id2, true, enchId);
-                        player->SendNewItem(item, 1, false, true);
-                    } else {
-                        handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id2, 1);
-                        return false;
+                }
+            }
+            if (!cur_have || prevscore < nextscore || second_best) {
+                uint32 item_id = next_item_templ->ItemId;
+                ItemPosCountVec dest;
+                InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item_id, 1);
+                if (msg == EQUIP_ERR_OK) {
+                    int32 enchId;
+                    CalculateBestRandomEnchant(swm, next_item_templ, enchId);
+                    Item* item = player->StoreNewItem(dest, item_id, true, enchId);
+                    player->SendNewItem(item, 1, false, true);
+                    if (item)
+                        new_items.push_back(item);
+                } else {
+                    handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id, 1);
+                    return false;
+                }
+                // let's see if we can add two items!
+                if (!second_best && use_two && slot_items.size() > 1) {
+                    ItemTemplate const* next_next_proto = slot_items[1].first;
+                    double nextnext = slot_items[1].second;
+                    // We need to beat out the best item we already have (if it exists, otherwise win automatically).
+                    if (cur_have) {
+                        if (next_next_proto->ItemId != cur_have->ItemId && nextnext > prevscore)
+                            second_best = true;
+                    } else
+                        second_best = true;
+                    if (second_best) {
+                        ItemPosCountVec dest2;
+                        uint32 item_id2 = next_next_proto->ItemId;
+                        msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest2, item_id2, 1);
+                        if (msg == EQUIP_ERR_OK) {
+                            int32 enchId;
+                            CalculateBestRandomEnchant(swm, next_next_proto, enchId);
+                            Item* item = player->StoreNewItem(dest2, item_id2, true, enchId);
+                            player->SendNewItem(item, 1, false, true);
+                            if (item)
+                                new_items.push_back(item);
+                        } else {
+                            handler->PSendSysMessage(LANG_ITEM_CANNOT_CREATE, item_id2, 1);
+                            return false;
+                        }
                     }
                 }
             }
         }
-    }
-    return true;
+        return true;
+    };
+    bool ok = grant_items();
+
+    // Auto-gem: equipped gear, newly granted items, and the best item(s) we already had per slot.
+    std::unordered_set<ItemTemplate const*> top_have;
+    for (auto const& [invtype, slot_items] : have_items)
+        for (size_t idx = 0; idx < slot_items.size() && idx < 2; ++idx)
+            top_have.insert(slot_items[idx].first);
+    std::vector<Item*> gem_targets;
+    std::unordered_set<Item*> seen_targets;
+    auto add_target = [&](Item* item) {
+        if (item && seen_targets.insert(item).second)
+            gem_targets.push_back(item);
+    };
+    // Equipped first, so any epic gems the player owns go into worn gear:
+    for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; ++i)
+        add_target(player->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+    for (Item* item : new_items)
+        add_target(item);
+    ForEachOwnedItem(player, [&](Item* item) {
+        if (top_have.count(item->GetTemplate()))
+            add_target(item);
+    });
+    OwnedGemCounts owned_counts;
+    GemPool owned_gems = BuildOwnedGems(player, swm, owned_counts, rec_meta);
+    uint32 socketed = 0;
+    for (Item* item : gem_targets)
+        socketed += AutoGemItem(player, item, swm, gem_pool, owned_gems, owned_counts, rec_meta);
+    if (socketed)
+        handler->PSendSysMessage("autobis: socketed {} gem(s).", socketed);
+    return ok;
 }
