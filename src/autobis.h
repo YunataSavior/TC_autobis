@@ -11,6 +11,7 @@
 
 class Item;
 class SpellEffectInfo;
+class SpellInfo;
 struct ItemTemplate;
 
 class AutoBis {
@@ -35,17 +36,25 @@ class AutoBis {
             bool bonus = false;  // socket bonus earned
             std::array<GemCandidate, 3> gems{};
         };
+        // Permanent enchants:
+        struct EnchantCandidate {
+            SpellInfo const* spell = nullptr; // the enchanting spell (its item requirements decide where it fits)
+            uint32 enchId = 0;                // SpellItemEnchantment id
+            bool fromItem = false;            // applied from an item (armor kit, scope, ...)
+        };
+        using EnchantPool = std::vector<EnchantCandidate>;
     private:
         static const ScoreWeightMap& GetScoreWeightMap(Player *player);
         static void AdjustInvType(Player* player, uint32 &inv_type);
         // return: score of the best enchant; also populates "enchid" (set to 0 if invalid):
         static double CalculateBestRandomEnchant(const ScoreWeightMap &score_weights, ItemTemplate const* itemProto, int32& enchId);
         static double ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate,
-                                       GemPool const* gems = nullptr);
+                                       GemPool const* gems = nullptr, EnchantPool const* enchants = nullptr);
         static bool PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate);
         static void PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, Item *item,
-                                           ItemSlotMap &have_items, GemPool const* gems);
-        static void PopulateHaveItems(Player *player, ItemSlotMap &have_items, GemPool const* gems);
+                                           ItemSlotMap &have_items, GemPool const* gems, EnchantPool const* enchants);
+        static void PopulateHaveItems(Player *player, ItemSlotMap &have_items, GemPool const* gems,
+                                      EnchantPool const* enchants);
         // Gems:
         static bool GemUsableBy(Player* player, ItemTemplate const* gem, GemCandidate& out, const ScoreWeightMap& swm,
                                 uint32 recMeta);
@@ -60,6 +69,13 @@ class AutoBis {
         // returns number of gems newly socketed:
         static uint32 AutoGemItem(Player* player, Item* item, const ScoreWeightMap& swm, GemPool const& pool,
                                   GemPool const& owned, OwnedGemCounts& ownedCounts, uint32 recMeta);
+        // Permanent enchants:
+        static EnchantPool BuildEnchantPool(Player* player);
+        // Best-scoring enchant that fits the item (nullptr if none scores above 0):
+        static EnchantCandidate const* BestEnchantFor(const ScoreWeightMap& swm, ItemTemplate const* proto,
+                                                      EnchantPool const& pool, double& bestScore);
+        // returns true if the item was (re-)enchanted:
+        static bool AutoEnchantItem(Player* player, Item* item, const ScoreWeightMap& swm, EnchantPool const& pool);
     public:
         static bool Process(ChatHandler* handler);
 };

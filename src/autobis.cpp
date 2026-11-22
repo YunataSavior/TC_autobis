@@ -475,8 +475,33 @@ static double TotalWeight(const AutoBis::ScoreWeightMap& swm)
     return totalWeight;
 }
 
-// Score of a single SpellItemEnchantment (gem, socket bonus), using the same weights as item stats.
-static double ScoreEnchantment(const AutoBis::ScoreWeightMap& swm, uint32 enchId)
+// Weapon procs (and a few auras) that the generic scorer can't value, as rough "always on" stat
+//  equivalents (proc value x uptime). Key: SpellItemEnchantment id. -1 is weapon DPS, -2 is armor,
+//  like in the weight maps. An enchant listed here is scored from this table only.
+// These are hand-tuned guesses: adjust freely.
+static std::unordered_map<uint32, std::vector<std::pair<int32, double>>> const proc_enchant_values = {
+    {803,  {{-1, 4}}},                                                // Fiery Weapon
+    {1894, {{-1, 1}}},                                                // Icy Chill
+    {1898, {{-1, 3}}},                                                // Lifestealing
+    {1899, {{-1, 4}}},                                                // Unholy Weapon
+    {1900, {{ITEM_MOD_STRENGTH, 35}}},                                // Crusader
+    {2673, {{ITEM_MOD_AGILITY, 40}, {ITEM_MOD_HASTE_RATING, 15}}},    // Mongoose
+    {3225, {{ITEM_MOD_ARMOR_PENETRATION_RATING, 40}}},                // Executioner
+    {3239, {{-1, 4}}},                                                // Icebreaker
+    {3789, {{ITEM_MOD_ATTACK_POWER, 120}}},                           // Berserking
+    {3869, {{ITEM_MOD_PARRY_RATING, 50}}},                            // Blade Ward
+    // Death knight runeforging (only when the DK knows the rune):
+    {3368, {{ITEM_MOD_STRENGTH, 60}}},                                // Rune of the Fallen Crusader
+    {3369, {{-1, 3}}},                                                // Rune of Cinderglacier
+    {3370, {{-1, 5}}},                                                // Rune of Razorice
+    {3847, {{ITEM_MOD_STAMINA, 25}, {-2, 400}}},                      // Rune of the Stoneskin Gargoyle
+};
+
+// Score of a single SpellItemEnchantment (gem, socket bonus, permanent enchant), using the same weights
+//  as item stats. "proto" is the item it goes on (needed for "+X weapon damage"). If "scorable" is set,
+//  it's cleared when part of the enchant can't be valued (unknown proc, on-use effect, unmapped aura).
+static double ScoreEnchantment(const AutoBis::ScoreWeightMap& swm, uint32 enchId,
+                               ItemTemplate const* proto = nullptr, bool* scorable = nullptr)
 {
     if (!enchId)
         return 0.0;
@@ -484,26 +509,59 @@ static double ScoreEnchantment(const AutoBis::ScoreWeightMap& swm, uint32 enchId
     double totalWeight = TotalWeight(swm);
     if (!pEnchant || totalWeight <= 0.0)
         return 0.0;
+    auto weight = [&](int32 statId) {
+        auto fiter = swm.find(statId);
+        return fiter != swm.end() ? fiter->second : 0.0;
+    };
     double score = 0.0;
+    auto ptable = proc_enchant_values.find(enchId);
+    if (ptable != proc_enchant_values.end()) {
+        for (auto const& [statId, amount] : ptable->second)
+            score += amount * weight(statId) / totalWeight;
+        return score;
+    }
     for (uint8 tt = 0; tt < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
-        if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_STAT) {
-            auto fiter = swm.find(int32(pEnchant->spellid[tt]));
-            if (fiter != swm.end())
-                score += pEnchant->amount[tt] * fiter->second / totalWeight;
-        } else if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_EQUIP_SPELL) {
-            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(pEnchant->spellid[tt]);
-            if (!spellInfo)
-                continue;
-            // Spell power spells carry both "damage done" and "healing done" effects; count once.
-            std::unordered_set<int32> seen;
-            for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
-                int32 statId = SpellEffectInfoToItemMod(spellInfo->Effects[jdx]);
-                if (statId == INT_MIN || !seen.insert(statId).second)
-                    continue;
-                auto fiter = swm.find(statId);
-                if (fiter != swm.end())
-                    score += spellInfo->Effects[jdx].CalcValue() * fiter->second / totalWeight;
+        switch (pEnchant->type[tt]) {
+            case ITEM_ENCHANTMENT_TYPE_NONE:
+                break;
+            case ITEM_ENCHANTMENT_TYPE_STAT:
+                score += pEnchant->amount[tt] * weight(int32(pEnchant->spellid[tt])) / totalWeight;
+                break;
+            case ITEM_ENCHANTMENT_TYPE_RESISTANCE:
+                // spellid is the school; physical "resistance" is armor:
+                if (pEnchant->spellid[tt] == SPELL_SCHOOL_NORMAL)
+                    score += pEnchant->amount[tt] * weight(-2) / totalWeight;
+                break;
+            case ITEM_ENCHANTMENT_TYPE_DAMAGE:
+                // "+X weapon damage": convert to DPS like the weapon itself.
+                if (proto && proto->Class == ITEM_CLASS_WEAPON && proto->Delay > 0) {
+                    uint32 invtype = proto->InventoryType;
+                    bool ranged = invtype == INVTYPE_RANGED || invtype == INVTYPE_THROWN || invtype == INVTYPE_RANGEDRIGHT;
+                    score += 1000.0 * pEnchant->amount[tt] / proto->Delay * weight(ranged ? -3 : -1) / totalWeight;
+                }
+                break;
+            case ITEM_ENCHANTMENT_TYPE_EQUIP_SPELL: {
+                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(pEnchant->spellid[tt]);
+                bool mapped = false;
+                if (spellInfo) {
+                    // Spell power spells carry both "damage done" and "healing done" effects; count once.
+                    std::unordered_set<int32> seen;
+                    for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
+                        int32 statId = SpellEffectInfoToItemMod(spellInfo->Effects[jdx]);
+                        if (statId == INT_MIN || !seen.insert(statId).second)
+                            continue;
+                        mapped = true;
+                        score += spellInfo->Effects[jdx].CalcValue() * weight(statId) / totalWeight;
+                    }
+                }
+                if (!mapped && scorable)
+                    *scorable = false;
+                break;
             }
+            default: // procs not in the table above, on-use effects, totems, sockets
+                if (scorable)
+                    *scorable = false;
+                break;
         }
     }
     return score;
@@ -829,8 +887,269 @@ uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& sw
     return socketed;
 }
 
+//
+// Permanent enchants
+//
+// Sources (built once, see LoadEnchantSources):
+//  - Enchanting recipes that can be learned from a trainer, an auto-learn, or a recipe item that does
+//    not need reputation.
+//  - Items with an on-use permanent enchant (armor kits, scopes, spurs, leg armors, spellthreads, ...)
+//    that a profession can craft from such a recipe. This leaves out reputation, quest and test items.
+//    Quality is capped at rare, like the free gems.
+// Gate per source: the enchant's required level, the item's required level (if any), and the level
+//  needed to train the profession up to the recipe's skill requirement (see LevelForProfessionSkill).
+// On top of that, the player's own known enchant spells are always usable (e.g. profession perks
+//  like Fur Lining or Lightweave Embroidery, death knight runes).
+
+namespace {
+struct EnchantSource {
+    SpellInfo const* spell = nullptr;
+    uint32 enchId = 0;
+    uint32 reqLevel = 0;
+    ItemTemplate const* item = nullptr; // set if the enchant is applied from an item
+};
+std::vector<EnchantSource> enchant_sources;
+bool enchant_sources_loaded = false;
+}
+
+// Player level needed to train a profession up to "skill" (Apprentice .. Grand Master). Taken from
+//  AzerothCore's trainer_spell data (the profession rank spells' ReqLevel).
+static uint32 LevelForProfessionSkill(uint32 skill)
+{
+    static constexpr std::pair<uint32, uint32> ranks[] = {
+        {75, 5}, {150, 10}, {225, 20}, {300, 35}, {375, 50}, {450, 65},
+    };
+    for (auto const& [cap, level] : ranks)
+        if (skill <= cap)
+            return level;
+    return DEFAULT_MAX_LEVEL;
+}
+
+// The permanent enchant a spell applies, or 0. Skips enchants autobis never applies: on-use effects
+//  (they can't go on items that already have one) and sockets.
+static uint32 PermEnchantOf(SpellInfo const* spellInfo)
+{
+    if (!spellInfo)
+        return 0;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i) {
+        if (spellInfo->Effects[i].Effect != SPELL_EFFECT_ENCHANT_ITEM || spellInfo->Effects[i].MiscValue <= 0)
+            continue;
+        uint32 enchId = uint32(spellInfo->Effects[i].MiscValue);
+        SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(enchId);
+        if (!pEnchant)
+            return 0;
+        for (uint8 tt = 0; tt < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++tt)
+            if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_USE_SPELL
+                || pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_PRISMATIC_SOCKET)
+                return 0;
+        return enchId;
+    }
+    return 0;
+}
+
+static void LoadEnchantSources()
+{
+    if (enchant_sources_loaded)
+        return;
+    enchant_sources_loaded = true;
+    enchant_sources.clear();
+
+    // Lowest player level at which each profession recipe can be learned without reputation:
+    std::unordered_map<uint32, uint32> learn_level;
+    auto offer = [&](uint32 spellId, uint32 level) {
+        auto [it, inserted] = learn_level.try_emplace(spellId, level);
+        if (!inserted && level < it->second)
+            it->second = level;
+    };
+    //                                                   0         1          2
+    if (QueryResult result = WorldDatabase.Query("SELECT SpellId, ReqSkillRank, ReqLevel FROM trainer_spell")) {
+        do {
+            Field* fields = result->Fetch();
+            offer(fields[0].Get<uint32>(),
+                  std::max(LevelForProfessionSkill(fields[1].Get<uint32>()), uint32(fields[2].Get<uint8>())));
+        } while (result->NextRow());
+    }
+    ItemTemplateContainer const* items = sObjectMgr->GetItemTemplateStore();
+    for (auto const& [itemId, proto] : *items) {
+        if (proto.Class != ITEM_CLASS_RECIPE || proto.RequiredReputationFaction)
+            continue;
+        for (uint8 k = 0; k < MAX_ITEM_PROTO_SPELLS; ++k)
+            if (proto.Spells[k].SpellTrigger == ITEM_SPELLTRIGGER_LEARN_SPELL_ID && proto.Spells[k].SpellId > 0)
+                offer(uint32(proto.Spells[k].SpellId),
+                      std::max(LevelForProfessionSkill(proto.RequiredSkillRank), proto.RequiredLevel));
+    }
+
+    // One pass over all spells: enchanting recipes, and which profession spells craft which item.
+    std::unordered_map<uint32, std::vector<uint32>> crafted_by; // item id -> profession spells
+    auto add_source = [](SpellInfo const* spellInfo, uint32 enchId, uint32 level, ItemTemplate const* item) {
+        SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(enchId);
+        enchant_sources.push_back({spellInfo, enchId, std::max(level, pEnchant->requiredLevel), item});
+    };
+    for (uint32 id = 0; id < sSpellMgr->GetSpellInfoStoreSize(); ++id) {
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(id);
+        if (!spellInfo)
+            continue;
+        bool profession = false, enchanting = false;
+        SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(id);
+        for (auto it = bounds.first; it != bounds.second; ++it) {
+            SkillLineEntry const* skillLine = sSkillLineStore.LookupEntry(it->second->SkillLine);
+            if (!skillLine || (skillLine->categoryId != SKILL_CATEGORY_PROFESSION
+                               && skillLine->categoryId != SKILL_CATEGORY_SECONDARY))
+                continue;
+            profession = true;
+            if (it->second->SkillLine == SKILL_ENCHANTING)
+                enchanting = true;
+            if (it->second->AcquireMethod == SKILL_LINE_ABILITY_LEARNED_ON_SKILL_VALUE
+                || it->second->AcquireMethod == SKILL_LINE_ABILITY_LEARNED_ON_SKILL_LEARN)
+                offer(id, LevelForProfessionSkill(it->second->MinSkillLineRank));
+        }
+        if (!profession)
+            continue;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (spellInfo->Effects[i].Effect == SPELL_EFFECT_CREATE_ITEM && spellInfo->Effects[i].ItemType)
+                crafted_by[spellInfo->Effects[i].ItemType].push_back(id);
+        if (!enchanting)
+            continue;
+        uint32 enchId = PermEnchantOf(spellInfo);
+        auto lit = learn_level.find(id);
+        if (enchId && lit != learn_level.end())
+            add_source(spellInfo, enchId, lit->second, nullptr);
+    }
+
+    // Crafted enchant items:
+    for (auto const& [itemId, proto] : *items) {
+        if (proto.Class == ITEM_CLASS_RECIPE || proto.Quality > ITEM_QUALITY_RARE || proto.RequiredReputationFaction
+            || proto.HasFlag(ITEM_FLAG_DEPRECATED) || proto.HasFlag2(ITEM_FLAG2_SHOW_BEFORE_DISCOVERED))
+            continue;
+        auto cit = crafted_by.find(itemId);
+        if (cit == crafted_by.end())
+            continue;
+        for (uint8 k = 0; k < MAX_ITEM_PROTO_SPELLS; ++k) {
+            if (proto.Spells[k].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE || proto.Spells[k].SpellId <= 0)
+                continue;
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(proto.Spells[k].SpellId);
+            uint32 enchId = PermEnchantOf(spellInfo);
+            if (!enchId)
+                continue;
+            uint32 level = UINT32_MAX;
+            for (uint32 craftSpell : cit->second) {
+                auto lit = learn_level.find(craftSpell);
+                if (lit != learn_level.end())
+                    level = std::min(level, lit->second);
+            }
+            if (level != UINT32_MAX)
+                add_source(spellInfo, enchId, std::max(level, proto.RequiredLevel), &proto);
+            break;
+        }
+    }
+    LOG_INFO("module.autobis", "autobis: loaded {} permanent enchant sources.", enchant_sources.size());
+}
+
+AutoBis::EnchantPool AutoBis::BuildEnchantPool(Player* player)
+{
+    LoadEnchantSources();
+    uint32 level = player->GetLevel();
+    auto enchant_ok = [&](uint32 enchId) {
+        SpellItemEnchantmentEntry const* pEnchant = sSpellItemEnchantmentStore.LookupEntry(enchId);
+        if (!pEnchant || pEnchant->requiredLevel > level)
+            return false;
+        // e.g. ring enchants (enchanters only), Fur Lining (leatherworkers only):
+        return !pEnchant->requiredSkill || player->GetSkillValue(pEnchant->requiredSkill) >= pEnchant->requiredSkillValue;
+    };
+    EnchantPool pool;
+    std::unordered_set<uint32> seen; // spell ids
+    for (EnchantSource const& src : enchant_sources) {
+        if (src.reqLevel > level || !enchant_ok(src.enchId))
+            continue;
+        if (src.item && player->CanUseItem(src.item) != EQUIP_ERR_OK)
+            continue;
+        if (seen.insert(src.spell->Id).second)
+            pool.push_back({src.spell, src.enchId, src.item != nullptr});
+    }
+    // Enchants the player knows (profession perks, death knight runes, recipes they learned themselves):
+    for (auto const& [spellId, playerSpell] : player->GetSpellMap()) {
+        if (!player->HasSpell(spellId))
+            continue;
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        uint32 enchId = PermEnchantOf(spellInfo);
+        if (enchId && enchant_ok(enchId) && seen.insert(spellId).second)
+            pool.push_back({spellInfo, enchId, false});
+    }
+    std::sort(pool.begin(), pool.end(),
+              [](EnchantCandidate const& l, EnchantCandidate const& r) { return l.spell->Id < r.spell->Id; });
+    return pool;
+}
+
+// Can this enchant go on this item? Mirrors Item::IsFitToSpellRequirements and the item level checks
+//  in Spell::CheckItems, but works on a template so it can also be used for scoring.
+static bool EnchantFitsItem(AutoBis::EnchantCandidate const& cand, ItemTemplate const* proto)
+{
+    SpellInfo const* spellInfo = cand.spell;
+    if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+        return false;
+    if (spellInfo->EquippedItemClass != -1) {
+        if (spellInfo->EquippedItemClass != int32(proto->Class))
+            return false;
+        if (spellInfo->EquippedItemSubClassMask != 0 && !(spellInfo->EquippedItemSubClassMask & (1 << proto->SubClass)))
+            return false;
+    }
+    if (spellInfo->EquippedItemInventoryTypeMask != 0) {
+        bool weaponForHand = proto->InventoryType == INVTYPE_WEAPON
+            && (spellInfo->EquippedItemInventoryTypeMask & ((1 << INVTYPE_WEAPONMAINHAND) | (1 << INVTYPE_WEAPONOFFHAND)));
+        if (!weaponForHand && !(spellInfo->EquippedItemInventoryTypeMask & (1 << proto->InventoryType)))
+            return false;
+    }
+    if (!spellInfo->HasAttribute(SPELL_ATTR2_ALLOW_LOW_LEVEL_BUFF)) {
+        uint32 itemLevel = proto->RequiredLevel ? proto->RequiredLevel : proto->ItemLevel;
+        if (itemLevel < spellInfo->BaseLevel)
+            return false; // e.g. WotLK enchants need a level 60+ item
+    }
+    if (cand.fromItem && spellInfo->MaxLevel > 0 && proto->ItemLevel > spellInfo->MaxLevel)
+        return false;
+    return true;
+}
+
+AutoBis::EnchantCandidate const* AutoBis::BestEnchantFor(const ScoreWeightMap& swm, ItemTemplate const* proto,
+                                                         EnchantPool const& pool, double& bestScore)
+{
+    EnchantCandidate const* best = nullptr;
+    bestScore = 0.0;
+    for (EnchantCandidate const& cand : pool) {
+        if (!EnchantFitsItem(cand, proto))
+            continue;
+        double score = ScoreEnchantment(swm, cand.enchId, proto);
+        if (score > bestScore) {
+            bestScore = score;
+            best = &cand;
+        }
+    }
+    return best;
+}
+
+bool AutoBis::AutoEnchantItem(Player* player, Item* item, const ScoreWeightMap& swm, EnchantPool const& pool)
+{
+    ItemTemplate const* proto = item->GetTemplate();
+    uint32 current = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);
+    bool scorable = true;
+    double currentScore = ScoreEnchantment(swm, current, proto, &scorable);
+    // Never overwrite an enchant we can't value (e.g. a proc we don't know, or a gathering enchant).
+    if (!scorable)
+        return false;
+    double bestScore;
+    EnchantCandidate const* best = BestEnchantFor(swm, proto, pool, bestScore);
+    if (!best || best->enchId == current || bestScore <= currentScore)
+        return false;
+    // Same sequence as Spell::EffectEnchantItemPerm:
+    player->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, false);
+    item->SetEnchantment(PERM_ENCHANTMENT_SLOT, best->enchId, 0, 0, player->GetGUID());
+    player->ApplyEnchantment(item, PERM_ENCHANTMENT_SLOT, true);
+    player->RemoveTradeableItem(item);
+    item->ClearSoulboundTradeable(player);
+    return true;
+}
+
 double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTemplate const* itemTemplate,
-                                 GemPool const* gems)
+                                 GemPool const* gems, EnchantPool const* enchants)
 {
     // ...
     // AzerothCore keeps dmg_min1/dmg_max1 in the item template, so no per-item SQL query is needed:
@@ -903,6 +1222,13 @@ double AutoBis::ComputePawnScore(const ScoreWeightMap &score_weights, ItemTempla
     //  are compared fairly against unsocketed ones.
     if (gems)
         totalScore += PlanSockets(score_weights, itemTemplate, *gems, nullptr, nullptr, nullptr).score;
+    // Likewise with the best permanent enchant. This mostly matters where the item type decides which
+    //  enchants fit (two-hander vs. one-hander, shields, staves).
+    if (enchants) {
+        double enchScore;
+        BestEnchantFor(score_weights, itemTemplate, *enchants, enchScore);
+        totalScore += enchScore;
+    }
     return totalScore;
 }
 
@@ -970,21 +1296,22 @@ bool AutoBis::PlayerCanUseItem(Player *player, ItemTemplate const* itemTemplate)
 }
 
 void AutoBis::PopulateSingleHaveItem(Player *player, const ScoreWeightMap &swm, Item *item, ItemSlotMap &have_items,
-                                     GemPool const* gems)
+                                     GemPool const* gems, EnchantPool const* enchants)
 {
     ItemTemplate const *itemTemplate = item->GetTemplate();
     if (!PlayerCanUseItem(player, itemTemplate))
         return;
     uint32 inv_type = itemTemplate->InventoryType;
     AdjustInvType(player, inv_type);
-    double score = ComputePawnScore(swm, itemTemplate, gems);
+    double score = ComputePawnScore(swm, itemTemplate, gems, enchants);
     have_items[inv_type].push_back({itemTemplate, score});
 }
 
-void AutoBis::PopulateHaveItems(Player *player, ItemSlotMap &have_items, GemPool const* gems)
+void AutoBis::PopulateHaveItems(Player *player, ItemSlotMap &have_items, GemPool const* gems,
+                                EnchantPool const* enchants)
 {
     const ScoreWeightMap &swm = GetScoreWeightMap(player);
-    ForEachOwnedItem(player, [&](Item* item) { PopulateSingleHaveItem(player, swm, item, have_items, gems); });
+    ForEachOwnedItem(player, [&](Item* item) { PopulateSingleHaveItem(player, swm, item, have_items, gems, enchants); });
 }
 
 bool AutoBis::Process(ChatHandler* handler)
@@ -1006,9 +1333,11 @@ bool AutoBis::Process(ChatHandler* handler)
     // Free gems autobis may socket (uncommon/rare). Also used to score socketed items fairly:
     uint32 rec_meta = RecommendedMetaGem(player, swm);
     GemPool gem_pool = BuildGemPool(player, swm, rec_meta);
+    // Permanent enchants autobis may apply. Also used to score items:
+    EnchantPool enchant_pool = BuildEnchantPool(player);
     // First, populate "have_items" map with player's inventory + bank:
     ItemSlotMap have_items;
-    PopulateHaveItems(player, have_items, &gem_pool);
+    PopulateHaveItems(player, have_items, &gem_pool, &enchant_pool);
     for (auto &have_slots : have_items) {
         SlotItems &slot_items = have_slots.second;
         std::sort(slot_items.begin(), slot_items.end(), ItemCompare());
@@ -1048,7 +1377,7 @@ bool AutoBis::Process(ChatHandler* handler)
                 break;
         }
         if (fiter == have_si.end()) {
-            double score = ComputePawnScore(swm, item_template, &gem_pool);
+            double score = ComputePawnScore(swm, item_template, &gem_pool, &enchant_pool);
             next_items[inv_type].push_back({item_template, score});
         }
     }
@@ -1138,7 +1467,7 @@ bool AutoBis::Process(ChatHandler* handler)
     };
     bool ok = grant_items();
 
-    // Auto-gem: equipped gear, newly granted items, and the best item(s) we already had per slot.
+    // Auto-gem and auto-enchant: equipped gear, newly granted items, and the best item(s) we already had per slot.
     std::unordered_set<ItemTemplate const*> top_have;
     for (auto const& [invtype, slot_items] : have_items)
         for (size_t idx = 0; idx < slot_items.size() && idx < 2; ++idx)
@@ -1165,5 +1494,11 @@ bool AutoBis::Process(ChatHandler* handler)
         socketed += AutoGemItem(player, item, swm, gem_pool, owned_gems, owned_counts, rec_meta);
     if (socketed)
         handler->PSendSysMessage("autobis: socketed {} gem(s).", socketed);
+    uint32 enchanted = 0;
+    for (Item* item : gem_targets)
+        if (AutoEnchantItem(player, item, swm, enchant_pool))
+            ++enchanted;
+    if (enchanted)
+        handler->PSendSysMessage("autobis: enchanted {} item(s).", enchanted);
     return ok;
 }
