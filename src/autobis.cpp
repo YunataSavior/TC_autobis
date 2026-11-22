@@ -16,6 +16,7 @@
 #include "Language.h"
 #include "Log.h"
 #include "ObjectMgr.h"
+#include "SpellAuraEffects.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "WorldSession.h"
@@ -567,6 +568,81 @@ static double ScoreEnchantment(const AutoBis::ScoreWeightMap& swm, uint32 enchId
     return score;
 }
 
+// How much of "statIds" (e.g. hit rating) an enchantment gives: stats and mapped equip auras.
+static double EnchantStatAmount(uint32 enchId, std::vector<int32> const& statIds)
+{
+    SpellItemEnchantmentEntry const* pEnchant = enchId ? sSpellItemEnchantmentStore.LookupEntry(enchId) : nullptr;
+    if (!pEnchant)
+        return 0.0;
+    auto wanted = [&](int32 statId) { return std::find(statIds.begin(), statIds.end(), statId) != statIds.end(); };
+    double amount = 0.0;
+    for (uint8 tt = 0; tt < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++tt) {
+        if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_STAT && wanted(int32(pEnchant->spellid[tt]))) {
+            amount += pEnchant->amount[tt];
+        } else if (pEnchant->type[tt] == ITEM_ENCHANTMENT_TYPE_EQUIP_SPELL) {
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(pEnchant->spellid[tt]);
+            if (!spellInfo)
+                continue;
+            std::unordered_set<int32> seen;
+            for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
+                int32 statId = SpellEffectInfoToItemMod(spellInfo->Effects[jdx]);
+                if (statId != INT_MIN && wanted(statId) && seen.insert(statId).second)
+                    amount += spellInfo->Effects[jdx].CalcValue();
+            }
+        }
+    }
+    return amount;
+}
+
+// How much of "statIds" an item gives, not counting its gems and socket bonus (those get re-planned):
+//  base stats, equip auras, the permanent enchant and random properties.
+static double ItemStatAmountWithoutGems(Item* item, std::vector<int32> const& statIds)
+{
+    ItemTemplate const* proto = item->GetTemplate();
+    auto wanted = [&](int32 statId) { return std::find(statIds.begin(), statIds.end(), statId) != statIds.end(); };
+    double amount = 0.0;
+    for (uint32 idx = 0; idx < proto->StatsCount && idx < MAX_ITEM_PROTO_STATS; ++idx)
+        if (wanted(int32(proto->ItemStat[idx].ItemStatType)) && proto->ItemStat[idx].ItemStatValue > 0)
+            amount += proto->ItemStat[idx].ItemStatValue;
+    for (uint32 idx = 0; idx < MAX_ITEM_PROTO_SPELLS; ++idx) {
+        if (proto->Spells[idx].SpellId <= 0 || proto->Spells[idx].SpellTrigger != ITEM_SPELLTRIGGER_ON_EQUIP)
+            continue;
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(proto->Spells[idx].SpellId);
+        if (!spellInfo)
+            continue;
+        std::unordered_set<int32> seen;
+        for (uint8 jdx = 0; jdx < MAX_SPELL_EFFECTS; ++jdx) {
+            int32 statId = SpellEffectInfoToItemMod(spellInfo->Effects[jdx]);
+            if (statId != INT_MIN && wanted(statId) && seen.insert(statId).second)
+                amount += spellInfo->Effects[jdx].CalcValue();
+        }
+    }
+    amount += EnchantStatAmount(item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT), statIds);
+    for (uint32 es = PROP_ENCHANTMENT_SLOT_0; es < MAX_ENCHANTMENT_SLOT; ++es)
+        amount += EnchantStatAmount(item->GetEnchantmentId(EnchantmentSlot(es)), statIds);
+    return amount;
+}
+
+// Score of a gem under the cap budget: hit/expertise at the cap weight while under the cap, 0 past it.
+static double CappedGemScore(AutoBis::GemCandidate const& cand, AutoBis::CapBudget const* budget)
+{
+    if (!budget || !budget->active)
+        return cand.score;
+    double score = cand.score;
+    score -= (cand.hit * budget->hitWeight + cand.expertise * budget->expertiseWeight) / budget->totalWeight;
+    score += (std::min(cand.hit, budget->hit) * budget->hitCapWeight
+              + std::min(cand.expertise, budget->expertise) * budget->expertiseCapWeight) / budget->totalWeight;
+    return score;
+}
+
+static void SpendBudget(AutoBis::CapBudget* budget, double hit, double expertise)
+{
+    if (!budget)
+        return;
+    budget->hit = std::max(0.0, budget->hit - hit);
+    budget->expertise = std::max(0.0, budget->expertise - expertise);
+}
+
 // Can the player use this gem at all (level, skill, not unique/limited)? Fills "out" if so.
 // Meta gems: always presume the player has enough colors to activate them, and make sure a meta
 //  socket always wins (head gear with a meta gem beats head gear without). The advised meta for the
@@ -600,6 +676,8 @@ bool AutoBis::GemUsableBy(Player* player, ItemTemplate const* gem, GemCandidate&
     out.enchId = gemProps->spellitemenchantement;
     out.color = gemProps->color;
     out.score = ScoreEnchantment(swm, out.enchId);
+    out.hit = EnchantStatAmount(out.enchId, {ITEM_MOD_HIT_RATING});
+    out.expertise = EnchantStatAmount(out.enchId, {ITEM_MOD_EXPERTISE_RATING});
     if (out.color & SOCKET_COLOR_META)
         out.score += (gem->ItemId == recMeta) ? 2 * META_SCORE : META_SCORE;
     return true;
@@ -615,6 +693,41 @@ static int8 InferTalentTree(Player* player)
 
 // Meta gems people advise per class/spec. Each list is in order of preference: WotLK first, then the
 //  TBC equivalent as a fallback in case the WotLK one isn't usable.
+enum class GemRole { Physical, Tank, Caster, Healer, HotHealer };
+
+// Role by class and spec (talent tree), with a class fallback. Drives the meta gem and the hit caps.
+static GemRole InferRole(Player* player)
+{
+    int8 tree = InferTalentTree(player); // talent tab page: 0, 1, 2
+    switch (player->getClass()) {
+        case CLASS_WARRIOR:      // Arms, Fury, Protection
+            return tree == 2 ? GemRole::Tank : GemRole::Physical;
+        case CLASS_PALADIN:      // Holy, Protection, Retribution
+            if (tree == 0) return GemRole::Healer;
+            if (tree == 1) return GemRole::Tank;
+            return GemRole::Physical;
+        case CLASS_DEATH_KNIGHT: // Blood, Frost, Unholy
+            return tree == 0 ? GemRole::Tank : GemRole::Physical;
+        case CLASS_PRIEST:       // Discipline, Holy, Shadow
+            if (tree == 0) return GemRole::Healer;
+            if (tree == 1) return GemRole::HotHealer;
+            return GemRole::Caster;
+        case CLASS_SHAMAN:       // Elemental, Enhancement, Restoration
+            if (tree == 0) return GemRole::Caster;
+            if (tree == 2) return GemRole::HotHealer;
+            return GemRole::Physical; // fallback matches the enhancement weight map
+        case CLASS_DRUID:        // Balance, Feral, Restoration
+            if (tree == 0) return GemRole::Caster;
+            if (tree == 2) return GemRole::HotHealer;
+            return GemRole::Physical; // fallback matches the cat weight map
+        case CLASS_MAGE:
+        case CLASS_WARLOCK:
+            return GemRole::Caster;
+        default:                 // Hunter, Rogue
+            return GemRole::Physical;
+    }
+}
+
 static std::vector<uint32> const& AdvisedMetaGems(Player* player)
 {
     static const std::vector<uint32> physical = {41398 /* Relentless Earthsiege */, 32409 /* Relentless Earthstorm */};
@@ -622,33 +735,12 @@ static std::vector<uint32> const& AdvisedMetaGems(Player* player)
     static const std::vector<uint32> caster   = {41285 /* Chaotic Skyflare */,      34220 /* Chaotic Skyfire */};
     static const std::vector<uint32> healer   = {41401 /* Insightful Earthsiege */, 25901 /* Insightful Earthstorm */};
     static const std::vector<uint32> hot_heal = {41376 /* Revitalizing Skyflare */, 25901 /* Insightful Earthstorm */};
-    int8 tree = InferTalentTree(player); // talent tab page: 0, 1, 2
-    switch (player->getClass()) {
-        case CLASS_WARRIOR:      // Arms, Fury, Protection
-            return tree == 2 ? tank : physical;
-        case CLASS_PALADIN:      // Holy, Protection, Retribution
-            if (tree == 0) return healer;
-            if (tree == 1) return tank;
-            return physical;
-        case CLASS_DEATH_KNIGHT: // Blood, Frost, Unholy
-            return tree == 0 ? tank : physical;
-        case CLASS_PRIEST:       // Discipline, Holy, Shadow
-            if (tree == 0) return healer;
-            if (tree == 1) return hot_heal;
-            return caster;
-        case CLASS_SHAMAN:       // Elemental, Enhancement, Restoration
-            if (tree == 0) return caster;
-            if (tree == 2) return hot_heal;
-            return physical;     // fallback matches the enhancement weight map
-        case CLASS_DRUID:        // Balance, Feral, Restoration
-            if (tree == 0) return caster;
-            if (tree == 2) return hot_heal;
-            return physical;     // fallback matches the cat weight map
-        case CLASS_MAGE:
-        case CLASS_WARLOCK:
-            return caster;
-        default:                 // Hunter, Rogue
-            return physical;
+    switch (InferRole(player)) {
+        case GemRole::Tank:      return tank;
+        case GemRole::Caster:    return caster;
+        case GemRole::Healer:    return healer;
+        case GemRole::HotHealer: return hot_heal;
+        default:                 return physical;
     }
 }
 
@@ -741,13 +833,14 @@ static bool GemFitsSocket(uint32 socketColor, uint32 gemColor)
 // "owned" gems are limited by "ownedCounts"; "current" are the gems already in this item (kept if best).
 AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate const* proto, GemPool const& pool,
                                       GemPool const* owned, OwnedGemCounts const* ownedCounts,
-                                      std::array<GemCandidate, 3> const* current)
+                                      std::array<GemCandidate, 3> const* current, CapBudget const* budget)
 {
     GemPlan best;
     bool have_best = false;
     for (int pass = 0; pass < 2; ++pass) {
         bool match_colors = (pass == 0);
         OwnedGemCounts counts = ownedCounts ? *ownedCounts : OwnedGemCounts();
+        CapBudget left = budget ? *budget : CapBudget();
         GemPlan plan;
         bool valid = true, all_match = true, has_socket = false;
         for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i) {
@@ -756,6 +849,7 @@ AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate co
                 continue;
             has_socket = true;
             GemCandidate const* pick = nullptr;
+            double pickScore = 0.0;
             auto consider = [&](GemCandidate const& cand) {
                 if (!cand.gem || !GemFitsSocket(socketColor, cand.color))
                     return;
@@ -764,8 +858,11 @@ AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate co
                 if (cand.source == GemSource::Owned && counts[cand.gem->ItemId] == 0)
                     return;
                 // strictly better only: ties prefer what's already socketed, then free gems, then owned.
-                if (!pick || cand.score > pick->score)
+                double score = CappedGemScore(cand, &left);
+                if (!pick || score > pickScore) {
                     pick = &cand;
+                    pickScore = score;
+                }
             };
             if (current)
                 consider((*current)[i]);
@@ -785,7 +882,10 @@ AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate co
             if (!(socketColor & pick->color))
                 all_match = false;
             plan.gems[i] = *pick;
-            plan.score += pick->score;
+            plan.score += pickScore;
+            plan.hit += pick->hit;
+            plan.expertise += pick->expertise;
+            SpendBudget(&left, pick->hit, pick->expertise);
         }
         if (!has_socket)
             return GemPlan();
@@ -794,6 +894,8 @@ AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate co
         if (all_match) {
             plan.score += ScoreEnchantment(swm, proto->socketBonus);
             plan.bonus = true;
+            plan.hit += EnchantStatAmount(proto->socketBonus, {ITEM_MOD_HIT_RATING});
+            plan.expertise += EnchantStatAmount(proto->socketBonus, {ITEM_MOD_EXPERTISE_RATING});
         }
         if (match_colors)
             return plan; // always activate the socket bonus when we can
@@ -807,7 +909,8 @@ AutoBis::GemPlan AutoBis::PlanSockets(const ScoreWeightMap& swm, ItemTemplate co
 
 // Socket the best gems into "item", replacing worse ones. Mirrors WorldSession::HandleSocketOpcode.
 uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& swm, GemPool const& pool,
-                            GemPool const& owned, OwnedGemCounts& ownedCounts, uint32 recMeta)
+                            GemPool const& owned, OwnedGemCounts& ownedCounts, uint32 recMeta,
+                            CapBudget* budget)
 {
     ItemTemplate const* proto = item->GetTemplate();
     bool has_socket = false;
@@ -817,7 +920,8 @@ uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& sw
         return 0;
     // What's in there now:
     std::array<GemCandidate, 3> current{};
-    double current_score = 0.0;
+    double current_score = 0.0, current_hit = 0.0, current_expertise = 0.0;
+    CapBudget left = budget ? *budget : CapBudget();
     for (uint32 i = 0; i < MAX_ITEM_PROTO_SOCKETS; ++i) {
         uint32 enchId = item->GetEnchantmentId(EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + i));
         SpellItemEnchantmentEntry const* pEnchant = enchId ? sSpellItemEnchantmentStore.LookupEntry(enchId) : nullptr;
@@ -834,13 +938,21 @@ uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& sw
         if (current[i].color & SOCKET_COLOR_META)
             current[i].score += 3 * META_SCORE; // keep whatever meta is already socketed
         current[i].source = GemSource::Current;
-        current_score += current[i].score;
+        current[i].hit = EnchantStatAmount(enchId, {ITEM_MOD_HIT_RATING});
+        current[i].expertise = EnchantStatAmount(enchId, {ITEM_MOD_EXPERTISE_RATING});
+        current_score += CappedGemScore(current[i], &left);
+        current_hit += current[i].hit;
+        current_expertise += current[i].expertise;
+        SpendBudget(&left, current[i].hit, current[i].expertise);
     }
     bool current_bonus = item->GemsFitSockets();
-    if (current_bonus)
+    if (current_bonus) {
         current_score += ScoreEnchantment(swm, proto->socketBonus);
+        current_hit += EnchantStatAmount(proto->socketBonus, {ITEM_MOD_HIT_RATING});
+        current_expertise += EnchantStatAmount(proto->socketBonus, {ITEM_MOD_EXPERTISE_RATING});
+    }
 
-    GemPlan plan = PlanSockets(swm, proto, pool, &owned, &ownedCounts, &current);
+    GemPlan plan = PlanSockets(swm, proto, pool, &owned, &ownedCounts, &current, budget);
     // Re-gem if it scores better, or if it activates the socket bonus without destroying any epic
     //  (or better) gem the player socketed themselves. Never downgrade otherwise.
     bool replaces_epic = false;
@@ -850,8 +962,11 @@ uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& sw
     }
     bool better = plan.score > current_score + 1e-9;
     bool gains_bonus = plan.bonus && !current_bonus && !replaces_epic;
-    if (!better && !gains_bonus)
+    if (!better && !gains_bonus) {
+        SpendBudget(budget, current_hit, current_expertise);
         return 0;
+    }
+    SpendBudget(budget, plan.hit, plan.expertise);
 
     bool equipped = item->IsEquipped();
     uint8 slot = item->GetSlot();
@@ -885,6 +1000,171 @@ uint32 AutoBis::AutoGemItem(Player* player, Item* item, const ScoreWeightMap& sw
     item->ClearSoulboundTradeable(player);
     item->SendUpdateSockets();
     return socketed;
+}
+
+//
+// Gem shuffling: hit and expertise caps against same-level mobs
+//
+// Leveling is mostly same-level mobs, attacked from behind: 5% melee/ranged miss, 4% spell miss, and
+//  5% dodge (20 expertise). Parry is ignored (attacking from behind).
+static constexpr float SAME_LEVEL_MELEE_HIT_CAP = 5.0f;
+static constexpr float SAME_LEVEL_SPELL_HIT_CAP = 4.0f;
+static constexpr float SAME_LEVEL_EXPERTISE_CAP = 20.0f;
+
+static std::vector<uint8> CandidateEquipSlots(uint32 invType, bool ohDual, bool titansGrip)
+{
+    switch (invType) {
+        case INVTYPE_HEAD:      return {EQUIPMENT_SLOT_HEAD};
+        case INVTYPE_NECK:      return {EQUIPMENT_SLOT_NECK};
+        case INVTYPE_SHOULDERS: return {EQUIPMENT_SLOT_SHOULDERS};
+        case INVTYPE_CHEST:
+        case INVTYPE_ROBE:      return {EQUIPMENT_SLOT_CHEST};
+        case INVTYPE_WAIST:     return {EQUIPMENT_SLOT_WAIST};
+        case INVTYPE_LEGS:      return {EQUIPMENT_SLOT_LEGS};
+        case INVTYPE_FEET:      return {EQUIPMENT_SLOT_FEET};
+        case INVTYPE_WRISTS:    return {EQUIPMENT_SLOT_WRISTS};
+        case INVTYPE_HANDS:     return {EQUIPMENT_SLOT_HANDS};
+        case INVTYPE_FINGER:    return {EQUIPMENT_SLOT_FINGER1, EQUIPMENT_SLOT_FINGER2};
+        case INVTYPE_TRINKET:   return {EQUIPMENT_SLOT_TRINKET1, EQUIPMENT_SLOT_TRINKET2};
+        case INVTYPE_CLOAK:     return {EQUIPMENT_SLOT_BACK};
+        case INVTYPE_WEAPON:
+            if (ohDual)
+                return {EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND};
+            return {EQUIPMENT_SLOT_MAINHAND};
+        case INVTYPE_2HWEAPON:
+            if (titansGrip)
+                return {EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND};
+            return {EQUIPMENT_SLOT_MAINHAND};
+        case INVTYPE_WEAPONMAINHAND: return {EQUIPMENT_SLOT_MAINHAND};
+        case INVTYPE_WEAPONOFFHAND:
+        case INVTYPE_SHIELD:
+        case INVTYPE_HOLDABLE:  return {EQUIPMENT_SLOT_OFFHAND};
+        case INVTYPE_RANGED:
+        case INVTYPE_THROWN:
+        case INVTYPE_RANGEDRIGHT:
+        case INVTYPE_RELIC:     return {EQUIPMENT_SLOT_RANGED};
+        default:                return {};
+    }
+}
+
+AutoBis::WornItems AutoBis::ProjectWornItems(Player* player, const ScoreWeightMap& swm, std::vector<Item*> const& newItems,
+                                             GemPool const* gems, EnchantPool const* enchants, bool ohDual, bool titansGrip)
+{
+    WornItems worn{};
+    std::array<double, EQUIPMENT_SLOT_END> score{};
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot) {
+        worn[slot] = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (worn[slot])
+            score[slot] = ComputePawnScore(swm, worn[slot]->GetTemplate(), gems, enchants);
+    }
+    auto is_2h = [&](Item* item) { return item && item->GetTemplate()->InventoryType == INVTYPE_2HWEAPON; };
+    for (Item* item : newItems) {
+        ItemTemplate const* proto = item->GetTemplate();
+        double itemScore = ComputePawnScore(swm, proto, gems, enchants);
+        // Replace the worse of the candidate slots (an empty slot first):
+        int16 target = -1;
+        for (uint8 slot : CandidateEquipSlots(proto->InventoryType, ohDual, titansGrip)) {
+            if (target < 0 || !worn[slot] || (worn[target] && score[slot] < score[target]))
+                target = slot;
+        }
+        if (target < 0)
+            continue;
+        // An off-hand next to a two-hander doesn't happen without Titan's Grip:
+        if (target == EQUIPMENT_SLOT_OFFHAND && !titansGrip && is_2h(worn[EQUIPMENT_SLOT_MAINHAND]))
+            continue;
+        if (worn[target] && itemScore <= score[target])
+            continue;
+        worn[target] = item;
+        score[target] = itemScore;
+        if (target == EQUIPMENT_SLOT_MAINHAND && !titansGrip && proto->InventoryType == INVTYPE_2HWEAPON)
+            worn[EQUIPMENT_SLOT_OFFHAND] = nullptr;
+    }
+    return worn;
+}
+
+// Only count auras the player always has: their own passive spells (talents, racials such as the
+//  draenei's Heroic Presence). Not buffs, not another draenei's Heroic Presence, not item auras
+//  (gear is counted separately and may change).
+static bool PermanentOwnAura(Player* player, AuraEffect const* aurEff)
+{
+    return aurEff->GetCasterGUID() == player->GetGUID() && aurEff->GetSpellInfo()->IsPassive()
+        && !aurEff->GetBase()->GetCastItemGUID();
+}
+
+AutoBis::CapBudget AutoBis::ComputeCapBudget(Player* player, const ScoreWeightMap& swm, WornItems const& worn)
+{
+    CapBudget budget;
+    GemRole role = InferRole(player);
+    if (role == GemRole::Healer || role == GemRole::HotHealer)
+        return budget; // healers: no caps, plain weights
+    budget.totalWeight = TotalWeight(swm);
+    if (budget.totalWeight <= 0.0)
+        return budget;
+    budget.active = true;
+    auto weight = [&](int32 statId) {
+        auto fiter = swm.find(statId);
+        return fiter != swm.end() ? fiter->second : 0.0;
+    };
+    double top = 0.0; // the map's top stat (weapon DPS and armor excluded)
+    for (auto const& [statId, w] : swm)
+        if (statId >= 0)
+            top = std::max(top, w);
+    budget.hitWeight = weight(ITEM_MOD_HIT_RATING);
+    budget.expertiseWeight = weight(ITEM_MOD_EXPERTISE_RATING);
+    // While under the cap, value the stat just above the top stat (only if the map values it at all):
+    budget.hitCapWeight = budget.hitWeight > 0.0 ? std::max(budget.hitWeight, top * 1.01) : 0.0;
+    budget.expertiseCapWeight = budget.expertiseWeight > 0.0 ? std::max(budget.expertiseWeight, top * 1.01) : 0.0;
+
+    bool caster = role == GemRole::Caster;
+    bool ranged = player->getClass() == CLASS_HUNTER;
+    CombatRating hitCr = caster ? CR_HIT_SPELL : (ranged ? CR_HIT_RANGED : CR_HIT_MELEE);
+    int32 oldHitStat = caster ? ITEM_MOD_HIT_SPELL_RATING : (ranged ? ITEM_MOD_HIT_RANGED_RATING : ITEM_MOD_HIT_MELEE_RATING);
+    float hitCap = caster ? SAME_LEVEL_SPELL_HIT_CAP : SAME_LEVEL_MELEE_HIT_CAP;
+
+    // Hit from talents and racials:
+    float baseHit = 0.0f;
+    if (caster) {
+        baseHit = float(player->GetTotalAuraModifier(SPELL_AURA_MOD_SPELL_HIT_CHANCE,
+            [&](AuraEffect const* aurEff) { return PermanentOwnAura(player, aurEff); }));
+        // Most caster hit talents are spell modifiers (e.g. Elemental Precision). A talent may split this
+        //  over several effects for different spells, so count each talent once:
+        std::map<uint32, int32> perSpell;
+        for (AuraEffect const* aurEff : player->GetAuraEffectsByType(SPELL_AURA_ADD_FLAT_MODIFIER))
+            if (aurEff->GetMiscValue() == SPELLMOD_RESIST_MISS_CHANCE && PermanentOwnAura(player, aurEff))
+                perSpell[aurEff->GetId()] = std::max(perSpell[aurEff->GetId()], aurEff->GetAmount());
+        for (auto const& [spellId, amount] : perSpell)
+            baseHit += float(amount);
+    } else {
+        baseHit = float(player->GetTotalAuraModifier(SPELL_AURA_MOD_HIT_CHANCE,
+            [&](AuraEffect const* aurEff) { return PermanentOwnAura(player, aurEff); }));
+    }
+    double gearHit = 0.0, gearExpertise = 0.0;
+    for (Item* item : worn) {
+        if (!item)
+            continue;
+        gearHit += ItemStatAmountWithoutGems(item, {ITEM_MOD_HIT_RATING, oldHitStat});
+        gearExpertise += ItemStatAmountWithoutGems(item, {ITEM_MOD_EXPERTISE_RATING});
+    }
+    float hitMult = player->GetRatingMultiplier(hitCr); // % per rating at the player's level
+    if (hitMult > 0.0f)
+        budget.hit = std::max(0.0, (hitCap - baseHit) / hitMult - gearHit);
+
+    // Expertise (melee only) from talents and racials (e.g. Weapon Expertise, Human sword/mace):
+    if (!caster && !ranged) {
+        Item* mainhand = worn[EQUIPMENT_SLOT_MAINHAND];
+        float baseExpertise = float(player->GetTotalAuraModifier(SPELL_AURA_MOD_EXPERTISE, [&](AuraEffect const* aurEff) {
+            return PermanentOwnAura(player, aurEff)
+                && (aurEff->GetSpellInfo()->EquippedItemClass == -1
+                    || (mainhand && mainhand->IsFitToSpellRequirements(aurEff->GetSpellInfo())));
+        }));
+        float expMult = player->GetRatingMultiplier(CR_EXPERTISE); // expertise per rating
+        if (expMult > 0.0f)
+            budget.expertise = std::max(0.0, (SAME_LEVEL_EXPERTISE_CAP - baseExpertise) / expMult - gearExpertise);
+    }
+    LOG_DEBUG("module.autobis", "autobis: {} cap budget: base hit {:.2f}%, gear hit {:.0f}, hit left {:.0f}; "
+              "gear expertise {:.0f}, expertise left {:.0f}", player->GetName(), baseHit, gearHit, budget.hit,
+              gearExpertise, budget.expertise);
+    return budget;
 }
 
 //
@@ -1487,18 +1767,35 @@ bool AutoBis::Process(ChatHandler* handler)
         if (top_have.count(item->GetTemplate()))
             add_target(item);
     });
-    OwnedGemCounts owned_counts;
-    GemPool owned_gems = BuildOwnedGems(player, swm, owned_counts, rec_meta);
-    uint32 socketed = 0;
-    for (Item* item : gem_targets)
-        socketed += AutoGemItem(player, item, swm, gem_pool, owned_gems, owned_counts, rec_meta);
-    if (socketed)
-        handler->PSendSysMessage("autobis: socketed {} gem(s).", socketed);
+    // Enchants first, so their hit/expertise counts toward the caps below:
     uint32 enchanted = 0;
     for (Item* item : gem_targets)
         if (AutoEnchantItem(player, item, swm, enchant_pool))
             ++enchanted;
     if (enchanted)
         handler->PSendSysMessage("autobis: enchanted {} item(s).", enchanted);
+
+    // Gems: the gear the player will wear shares one hit/expertise budget (gem shuffling), so it
+    //  reaches the same-level caps and no further. Other items get plain weights.
+    WornItems worn = ProjectWornItems(player, swm, new_items, &gem_pool, &enchant_pool, oh_dual, titans_grip);
+    CapBudget budget = ComputeCapBudget(player, swm, worn);
+    std::unordered_set<Item*> worn_set(worn.begin(), worn.end());
+    OwnedGemCounts owned_counts;
+    GemPool owned_gems = BuildOwnedGems(player, swm, owned_counts, rec_meta);
+    uint32 socketed = 0;
+    for (Item* item : worn)
+        if (item)
+            socketed += AutoGemItem(player, item, swm, gem_pool, owned_gems, owned_counts, rec_meta, &budget);
+    for (Item* item : gem_targets)
+        if (!worn_set.count(item))
+            socketed += AutoGemItem(player, item, swm, gem_pool, owned_gems, owned_counts, rec_meta, nullptr);
+    if (socketed)
+        handler->PSendSysMessage("autobis: socketed {} gem(s).", socketed);
+    // Only report stats the weight map values (otherwise we never try to reach that cap):
+    double short_hit = budget.hitCapWeight > 0.0 ? budget.hit : 0.0;
+    double short_expertise = budget.expertiseCapWeight > 0.0 ? budget.expertise : 0.0;
+    if (budget.active && (short_hit >= 1.0 || short_expertise >= 1.0))
+        handler->PSendSysMessage("autobis: still short of the same-level caps by {:.0f} hit rating and {:.0f} expertise rating.",
+                                 short_hit, short_expertise);
     return ok;
 }

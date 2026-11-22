@@ -59,7 +59,12 @@ The Pawn maps are tuned for endgame raiding: Stamina and armor are worth almost 
    - **Leather and mail wearers:** a small boost to armor.
 2. **Hit and Expertise caps against same-level mobs:** 5% melee hit, about 4% spell hit, and about 5% dodge (roughly 20 Expertise). Converted to rating at the player's level and used for gems first, items later.
    - After that, restore the fury warrior Expertise weight to 100. The halved weight is a stopgap.
-   - **Gem shuffling:** re-gem so the player just reaches the same-level Hit and Expertise caps, and no further. This **must count talents** as well as gear, for example Precision and Weapon Expertise for warriors, Dual Wield Specialization, Combat Expertise, and the spell-hit talents.
+   - [x] **Gem shuffling (added 2026-11-22):** the gear the player will wear (equipped items, replaced by better newly granted ones) shares one hit/expertise budget. Under a cap, hit/expertise gems score just above the map's top stat; past it, 0. Other items get plain weights.
+     - **Talents and racials** come from the player's live auras, but only their own passive ones (for example Precision, Weapon Expertise, a draenei's own Heroic Presence). Buffs, another player's Heroic Presence, and item auras don't count.
+     - **Gear** counts base stats, equip auras, the permanent enchant and random properties. Enchants are applied before gems so they count.
+     - **Caps:** melee and ranged 5% (hunters use ranged hit and no expertise), spell 4% for casters, 20 expertise for melee. Healers get no caps. Parry is ignored.
+     - `.autobis` reports when sockets can't close the gap.
+     - **Open:** only gems are cap-aware. Enchants and item scoring still use plain weights. Respecs or new weapon types (racial expertise) need another `.autobis` run.
 3. **Order:** spec map (see the Gems section), then the leveling layer, then caps.
 4. **Guard rule:** after the layer is applied, check that no survivability stat outweighs the role's top stat. Assert or clamp to enforce it.
 

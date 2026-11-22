@@ -28,6 +28,8 @@ class AutoBis {
             uint32 color = 0;    // GemProperties color mask (SOCKET_COLOR_*)
             double score = 0.0;
             GemSource source = GemSource::Pool;
+            double hit = 0.0;       // hit rating the gem gives (for the cap budget)
+            double expertise = 0.0; // expertise rating the gem gives
         };
         using GemPool = std::vector<GemCandidate>;
         using OwnedGemCounts = std::map<uint32, uint32>; // gem item id -> count in bags/bank
@@ -35,7 +37,18 @@ class AutoBis {
             double score = 0.0;  // gems + socket bonus (if earned)
             bool bonus = false;  // socket bonus earned
             std::array<GemCandidate, 3> gems{};
+            double hit = 0.0, expertise = 0.0; // rating from the gems (and socket bonus)
         };
+        // Hit/expertise rating still useful on the worn gear before the same-level caps. While under a
+        //  cap, gems value that stat above the map's top stat; past it, at 0. Inactive = plain weights.
+        struct CapBudget {
+            bool active = false;
+            double hit = 0.0, expertise = 0.0;                  // rating left until the cap
+            double hitWeight = 0.0, expertiseWeight = 0.0;      // the map's own weights
+            double hitCapWeight = 0.0, expertiseCapWeight = 0.0; // weights while under the cap
+            double totalWeight = 1.0;
+        };
+        using WornItems = std::array<Item*, EQUIPMENT_SLOT_END>;
         // Permanent enchants:
         struct EnchantCandidate {
             SpellInfo const* spell = nullptr; // the enchanting spell (its item requirements decide where it fits)
@@ -65,10 +78,16 @@ class AutoBis {
                                       uint32 recMeta);
         static GemPlan PlanSockets(const ScoreWeightMap& swm, ItemTemplate const* proto, GemPool const& pool,
                                    GemPool const* owned, OwnedGemCounts const* ownedCounts,
-                                   std::array<GemCandidate, 3> const* current);
-        // returns number of gems newly socketed:
+                                   std::array<GemCandidate, 3> const* current, CapBudget const* budget = nullptr);
+        // returns number of gems newly socketed. With a budget, the hit/expertise that ends up in the
+        //  item is taken out of it:
         static uint32 AutoGemItem(Player* player, Item* item, const ScoreWeightMap& swm, GemPool const& pool,
-                                  GemPool const& owned, OwnedGemCounts& ownedCounts, uint32 recMeta);
+                                  GemPool const& owned, OwnedGemCounts& ownedCounts, uint32 recMeta,
+                                  CapBudget* budget);
+        // Gear the player will wear: equipped items, replaced by better newly granted ones:
+        static WornItems ProjectWornItems(Player* player, const ScoreWeightMap& swm, std::vector<Item*> const& newItems,
+                                          GemPool const* gems, EnchantPool const* enchants, bool ohDual, bool titansGrip);
+        static CapBudget ComputeCapBudget(Player* player, const ScoreWeightMap& swm, WornItems const& worn);
         // Permanent enchants:
         static EnchantPool BuildEnchantPool(Player* player);
         // Best-scoring enchant that fits the item (nullptr if none scores above 0):
